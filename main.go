@@ -15,6 +15,8 @@ import (
     "net/http"
     "net/url"
     "os"
+    "os/exec"
+    "runtime"
     "strconv"
     "strings"
     "sync"
@@ -43,13 +45,16 @@ var userAgents []string
 var totalSent atomic.Int64
 var totalSuccess atomic.Int64
 var totalErrors atomic.Int64
-
-var statusCodes [600]atomic.Int64
-var miscStatusCounts sync.Map
-
 var proxyList []string
 var zstdBombPayload []byte
 var startTime time.Time
+var statusCounts = make(map[string]int)
+var statusMutex = sync.Mutex{}
+var logBuf bytes.Buffer
+var logMutex = sync.Mutex{}
+var maxLogLines = 10
+var logLines []string
+var cBlink = "\033[5m"
 
 func init() {
     if uas, err := loadUserAgents("useragent.txt"); err == nil && len(uas) > 0 {
@@ -119,28 +124,62 @@ func loadProxies(filename string) ([]string, error) {
 }
 
 func recordStatus(code string) {
-    if len(code) == 3 {
-        if n, err := strconv.Atoi(code); err == nil && n >= 0 && n < 600 {
-            statusCodes[n].Add(1)
-            return
-        }
-    }
-    for {
-        v, ok := miscStatusCounts.Load(code)
-        if !ok {
-            if miscStatusCounts.CompareAndSwap(code, nil, int64(1)) {
-                return
-            }
-        } else {
-            nv := v.(int64) + 1
-            if miscStatusCounts.CompareAndSwap(code, v, nv) {
-                return
-            }
-        }
+    statusMutex.Lock()
+    statusCounts[code]++
+    statusMutex.Unlock()
+}
+
+func logEvent(msg string) {
+    logMutex.Lock()
+    defer logMutex.Unlock()
+    timestamp := time.Now().Format("15:04:05")
+    entry := fmt.Sprintf("[%s] %s", timestamp, msg)
+    logLines = append(logLines, entry)
+    if len(logLines) > maxLogLines {
+        logLines = logLines[len(logLines)-maxLogLines:]
     }
 }
 
+func getSysInfo() map[string]string {
+    info := make(map[string]string)
+    info["OS"] = runtime.GOOS + " " + runtime.GOARCH
+    info["CPU"] = fmt.Sprintf("%d cores", runtime.NumCPU())
+
+    if runtime.GOOS == "linux" {
+        if b, err := os.ReadFile("/etc/os-release"); err == nil {
+            for _, line := range strings.Split(string(b), "\n") {
+                if strings.HasPrefix(line, "PRETTY_NAME=") {
+                    info["OS"] = strings.Trim(strings.Split(line, "=")[1], `"`)
+                    break
+                }
+            }
+        }
+        if b, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
+            info["Kernel"] = strings.TrimSpace(string(b))
+        }
+        if b, err := os.ReadFile("/proc/meminfo"); err == nil {
+            lines := strings.Split(string(b), "\n")
+            if len(lines) > 0 {
+                info["Memory"] = strings.TrimSpace(lines[0])
+            }
+        }
+        if out, err := exec.Command("uname", "-n").Output(); err == nil {
+            info["Host"] = strings.TrimSpace(string(out))
+        } else {
+            info["Host"] = "Local-Machine"
+        }
+    } else {
+        info["Host"] = "Local-Machine"
+        info["Kernel"] = "N/A"
+        info["Memory"] = "N/A"
+    }
+
+    info["Uptime"] = time.Since(startTime).Round(time.Second).String()
+    return info
+}
+
 func drawUI(target, method, proxyFile string, workers, duration int) {
+    sysInfo := getSysInfo()
     sent := totalSent.Load()
     success := totalSuccess.Load()
     errors := totalErrors.Load()
@@ -149,6 +188,8 @@ func drawUI(target, method, proxyFile string, workers, duration int) {
         elapsed = 1
     }
     rps := float64(sent) / elapsed
+
+    fmt.Print("\033[H\033[2J")
 
     cReset := "\033[0m"
     cRed := "\033[31m"
@@ -160,50 +201,104 @@ func drawUI(target, method, proxyFile string, workers, duration int) {
     cBold := "\033[1m"
     cDim := "\033[2m"
 
+    logo := []string{
+        cRed + "      _,met$$$$$gg.          " + cReset,
+        cRed + "    ,g$$$$$$$$$$$$$$$P.       " + cReset,
+        cRed + "  ,g$$P\"     \"\"\"Y$$.\".        " + cReset,
+        cRed + " ,$$P'              `$$$.     " + cReset,
+        cRed + "',$$P       ,ggs.     `$$b:   " + cReset,
+        cRed + "`d$$'     ,$P\"'   .    $$$    " + cReset,
+        cRed + " $$P      d$'     ,    $$P    " + cReset,
+        cRed + " $$:      $$.   -    ,d$$'    " + cReset,
+        cRed + " $$;      Y$b._   _,d$P'      " + cReset,
+        cRed + " Y$$.    `.`\"Y$$$$P\"'         " + cReset,
+        cRed + " `$$b      \"-.__              " + cReset,
+        cRed + "  `Y$$                        " + cReset,
+        cRed + "   `Y$$.                      " + cReset,
+        cRed + "     `$$b.                    " + cReset,
+        cRed + "       `Y$$b.                 " + cReset,
+        cRed + "          `\"Y$b._             " + cReset,
+        cRed + "              `\"\"\"            " + cReset,
+    }
+
     proxyLabel := "DIRECT"
     if proxyFile != "" {
         proxyLabel = proxyFile
     }
 
-    var statusStr strings.Builder
-    for i := 0; i < 600; i++ {
-        n := statusCodes[i].Load()
-        if n > 0 {
-            color := cGreen
-            if i >= 400 && i < 500 {
-                color = cRed
-            } else if i >= 500 {
-                color = cRed
-            } else if i >= 300 {
-                color = cYellow
+    infoLines := []string{
+        cBold + cGreen + sysInfo["Host"] + cReset,
+        cDim + "-----------------------------------" + cReset,
+        cBold + "OS: " + cReset + sysInfo["OS"],
+        cBold + "Host: " + cReset + sysInfo["Host"],
+        cBold + "Kernel: " + cReset + sysInfo["Kernel"],
+        cBold + "Uptime: " + cReset + sysInfo["Uptime"],
+        cBold + "CPU: " + cReset + sysInfo["CPU"],
+        cBold + "Memory: " + cReset + sysInfo["Memory"],
+        cDim + "-----------------------------------" + cReset,
+        cBold + cRed + "TARGET: " + cReset + cWhite + target + cReset,
+        cBold + cMagenta + "METHOD: " + cReset + cWhite + strings.ToUpper(method) + cReset,
+        cBold + cYellow + "WORKERS: " + cReset + cWhite + strconv.Itoa(workers) + cReset,
+        cBold + cCyan + "PROXIES: " + cReset + cWhite + proxyLabel + cReset,
+        cDim + "-----------------------------------" + cReset,
+        cBold + cGreen + "SENT: " + cReset + cWhite + strconv.FormatInt(sent, 10) + cReset,
+        cBold + cCyan + "RPS: " + cReset + cWhite + fmt.Sprintf("%.0f", rps) + cReset,
+        cBold + cGreen + "SUCCESS: " + cReset + cWhite + strconv.FormatInt(success, 10) + cReset,
+        cBold + cRed + "ERRORS: " + cReset + cWhite + strconv.FormatInt(errors, 10) + cReset,
+        cDim + "-----------------------------------" + cReset,
+        cBold + "STATUS CODES:" + cReset,
+    }
+
+    statusMutex.Lock()
+    keys := make([]string, 0, len(statusCounts))
+    for k := range statusCounts {
+        keys = append(keys, k)
+    }
+    for i := 0; i < len(keys); i++ {
+        for j := i + 1; j < len(keys); j++ {
+            if keys[i] > keys[j] {
+                keys[i], keys[j] = keys[j], keys[i]
             }
-            statusStr.WriteString(fmt.Sprintf("  %s%d%s: %d\n", color, i, cReset, n))
         }
     }
-    miscStatusCounts.Range(func(key, value interface{}) bool {
-        k := key.(string)
-        v := value.(int64)
-        color := cRed
-        if k == "Sent" || k == "Held" || k == "RST" {
-            color = cGreen
-        }
-        statusStr.WriteString(fmt.Sprintf("  %s%s%s: %d\n", color, k, cReset, v))
-        return true
-    })
 
-    fmt.Print("\033[H\033[2J")
-    fmt.Printf("%sTARGET:%s %s%s\n", cBold+cRed, cReset, cWhite, target)
-    fmt.Printf("%sMETHOD:%s %s%s\n", cBold+cMagenta, cReset, cWhite, strings.ToUpper(method))
-    fmt.Printf("%sWORKERS:%s %s%d\n", cBold+cYellow, cReset, cWhite, workers)
-    fmt.Printf("%sPROXIES:%s %s%s\n", cBold+cCyan, cReset, cWhite, proxyLabel)
-    fmt.Println(cDim + "-----------------------------" + cReset)
-    fmt.Printf("%sSENT:%s %s%d\n", cBold+cGreen, cReset, cWhite, sent)
-    fmt.Printf("%sRPS:%s %s%.0f\n", cBold+cCyan, cReset, cWhite, rps)
-    fmt.Printf("%sSUCCESS:%s %s%d\n", cBold+cGreen, cReset, cWhite, success)
-    fmt.Printf("%sERRORS:%s %s%d\n", cBold+cRed, cReset, cWhite, errors)
-    fmt.Println(cDim + "-----------------------------" + cReset)
-    fmt.Printf("%sSTATUS CODES:%s\n", cBold, cReset)
-    fmt.Print(statusStr.String())
+    for _, k := range keys {
+        color := cGreen
+        if k == "Err" || strings.HasPrefix(k, "4") || strings.HasPrefix(k, "5") {
+            color = cRed
+        } else if strings.HasPrefix(k, "3") {
+            color = cYellow
+        }
+        infoLines = append(infoLines, "  "+color+k+cReset+": "+strconv.Itoa(statusCounts[k]))
+    }
+    statusMutex.Unlock()
+
+    maxLines := len(logo)
+    if len(infoLines) > maxLines {
+        maxLines = len(infoLines)
+    }
+
+    for i := 0; i < maxLines; i++ {
+        var l string
+        if i < len(logo) {
+            l = logo[i]
+        } else {
+            l = strings.Repeat(" ", 35)
+        }
+        if i < len(infoLines) {
+            l += "  " + infoLines[i]
+        }
+        fmt.Println(l)
+    }
+    fmt.Println()
+    fmt.Println(cBold + cCyan + "LIVE LOGS:" + cReset)
+    logMutex.Lock()
+    for _, line := range logLines {
+        fmt.Println(line)
+    }
+    logMutex.Unlock()
+    fmt.Println()
+    fmt.Println(cDim + "Press Ctrl+C to stop..." + cReset)
 }
 
 const (
@@ -234,7 +329,7 @@ func newTransport(proxyURL *url.URL) *http.Transport {
         ResponseHeaderTimeout: responseHeaderTimeout,
         DisableKeepAlives:     false,
         DisableCompression:    true,
-        ForceAttemptHTTP2:    false,
+        ForceAttemptHTTP2:     false,
     }
     if proxyURL != nil {
         t.Proxy = http.ProxyURL(proxyURL)
@@ -5921,10 +6016,18 @@ func main() {
         go Worker(i, targetURL, *method, clients, stop, *verbose, *rateDelay)
     }
 
-    // Chờ đến khi hết thời gian rồi mới in 1 lần duy nhất, không vẽ UI liên tục nữa
-    time.Sleep(time.Duration(duration) * time.Second)
-    close(stop)
-    drawUI(targetURL, *method, proxyFile, workers, duration)
-    fmt.Printf("\n  \033[1m\033[31mATTACK COMPLETE\033[0m\n")
-    os.Exit(0)
+    ticker := time.NewTicker(100 * time.Millisecond)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-time.After(time.Duration(duration) * time.Second):
+            close(stop)
+            drawUI(targetURL, *method, proxyFile, workers, duration)
+            fmt.Printf("\n  %s\033[1m\033[31mATTACK COMPLETE\033[0m\n", cBlink)
+            os.Exit(0)
+        case <-ticker.C:
+            drawUI(targetURL, *method, proxyFile, workers, duration)
+        }
+    }
 }
