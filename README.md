@@ -2,172 +2,618 @@
 
 # </> SLAYER L7
 
-**Advanced Multi-Protocol Layer 7 Stress Testing & Network Resilience Appliance**
+### Multi-Protocol Layer 7 Stress Testing & Network Resilience Toolkit
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
-[![Methods](https://img.shields.io/badge/Methods-75+-FF4136?style=for-the-badge&logo=codeforces&logoColor=white)](#-attack-vectors--methods)
-[![Architecture](https://img.shields.io/badge/Architecture-Goroutines-2EA44F?style=for-the-badge&logo=go&logoColor=white)](#-architecture--overview)
-[![Proxy](https://img.shields.io/badge/Proxy-SOCKS5%20%7C%20HTTP-1A1A1A?style=for-the-badge&logo=proxyman&logoColor=white)](#-cli-flags--configuration)
-[![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge&logo=readthedocs&logoColor=white)](LICENSE)
+<p>
+  <a href="https://go.dev/">
+    <img src="https://img.shields.io/badge/Go-1.21%2B-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go 1.21+">
+  </a>
+  <img src="https://img.shields.io/badge/Methods-75%2B-6E56CF?style=for-the-badge" alt="75+ Methods">
+  <img src="https://img.shields.io/badge/Architecture-Goroutines-2EA44F?style=for-the-badge&logo=go&logoColor=white" alt="Goroutines">
+  <img src="https://img.shields.io/badge/Proxy-SOCKS4%20%7C%20SOCKS5%20%7C%20HTTP-24292F?style=for-the-badge" alt="Proxy">
+  <img src="https://img.shields.io/badge/License-MIT-0969DA?style=for-the-badge&logo=opensourceinitiative&logoColor=white" alt="MIT License">
+</p>
 
-[Overview](#-architecture--overview) • [Installation](#-installation) • [Usage](#-cli-flags--configuration) • [Attack Vectors](#-attack-vectors--methods) • [Troubleshooting](#-troubleshooting) • [Disclaimer](#-security--legal-disclaimer)
+<p>
+  <strong>Controlled infrastructure testing · Resilience engineering · Security research</strong>
+</p>
+
+<p>
+  <a href="#overview">Overview</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#installation">Installation</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#test-methods">Test Methods</a> ·
+  <a href="#project-structure">Structure</a> ·
+  <a href="#troubleshooting">Troubleshooting</a> ·
+  <a href="#security--legal">Security</a>
+</p>
 
 </div>
 
 ---
 
-## 📖 Architecture & Overview
+## Overview
 
-**Slayer L7** is a modern, ultra-high-throughput network stress-testing engine engineered in Go. Designed to evaluate web server resilience, load balancers, and WAF rulesets, it leverages asynchronous Goroutines, custom TLS/HTTP handshakes, and low-allocation memory pools to deliver massive Request-Per-Second (RPS) workloads.
+**Slayer L7** is a Go-based multi-protocol stress-testing and network-resilience toolkit built for **authorized infrastructure assessments**.
 
-> **Key Capabilities:**
-> * **Zero-Allocation HTTP Forging**: Dynamic header generation, user-agent rotation, and payload polymorphic randomization.
-> * **Protocol Exploitation Vectors**: Implements HTTP/2 Rapid Reset (CVE-2023-44487), Continuation Floods, and HTTP Request Smuggling.
-> * **Built-in Proxy Engine**: Native SOCKS4/SOCKS5/HTTP proxy parsing with dynamic round-robin connection pooling.
-> * **Game Protocol Testing**: Specialized engines for Minecraft BungeeCord/Netty protocol validation and handshake stress testing.
+The project provides a single lightweight executable capable of generating controlled workloads across multiple application and network protocols, allowing administrators and security researchers to evaluate system behavior under increased traffic, connection pressure and protocol-specific workloads.
+
+### What Slayer L7 Provides
+
+* High-concurrency Go execution using Goroutines
+* HTTP/1.1 and HTTP/2 workload generation
+* Configurable request and connection behavior
+* SOCKS4 / SOCKS5 / HTTP proxy support
+* User-Agent rotation
+* Protocol-specific testing scenarios
+* Minecraft / Netty protocol testing
+* TCP, UDP and DNS workload testing
+* Configurable execution duration
+* Runtime diagnostics and error reporting
 
 ---
 
-## 🚀 Installation
+## Features
 
-### Prerequisites
+<table>
+<tr>
+<td width="50%" valign="top">
 
-* [Go (Golang)](https://go.dev/dl/) `v1.21` or higher.
-* POSIX-compliant environment (Linux / macOS) or Windows Subsystem for Linux (WSL).
+### HTTP & Application
 
-### Building from Source
+* HTTP GET / POST / PUT / DELETE
+* HEAD / OPTIONS requests
+* JSON workloads
+* Multipart requests
+* Form-data testing
+* Header-size testing
+* Cookie handling
+* Cache behavior testing
+* WebSocket testing
+* GraphQL workloads
+
+</td>
+<td width="50%" valign="top">
+
+### Network & Protocol
+
+* HTTP/1.1
+* HTTP/2
+* TCP
+* UDP
+* DNS
+* Minecraft / Netty
+* BungeeCord-compatible flows
+* Persistent connections
+* Proxy-based testing
+
+</td>
+</tr>
+
+<tr>
+<td valign="top">
+
+### Performance
+
+* Goroutine-based concurrency
+* Configurable worker count
+* Request pacing
+* Connection management
+* User-Agent rotation
+* Low-overhead execution
+* Long-running test sessions
+
+</td>
+<td valign="top">
+
+### Security Research
+
+* WAF validation
+* Rate-limit testing
+* Reverse-proxy analysis
+* Parser robustness testing
+* Connection-limit testing
+* HTTP/2 behavior analysis
+* Input validation testing
+* Infrastructure resilience testing
+
+</td>
+</tr>
+</table>
+
+---
+
+## Architecture
+
+Slayer L7 uses a compact Go architecture centered around a single executable.
+
+```text
+                         ┌───────────────────────┐
+                         │        CLI Input      │
+                         │ target / method /     │
+                         │ workers / duration    │
+                         └───────────┬───────────┘
+                                     │
+                                     ▼
+                         ┌───────────────────────┐
+                         │     Test Controller   │
+                         │   scenario selection  │
+                         └───────────┬───────────┘
+                                     │
+                  ┌──────────────────┼──────────────────┐
+                  │                  │                  │
+                  ▼                  ▼                  ▼
+           ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+           │ HTTP / L7   │    │ TCP / UDP   │    │ Minecraft   │
+           │ Test Engine │    │ Test Engine │    │ Test Engine │
+           └──────┬──────┘    └──────┬──────┘    └──────┬──────┘
+                  │                  │                  │
+                  └──────────────────┼──────────────────┘
+                                     │
+                                     ▼
+                         ┌───────────────────────┐
+                         │    Proxy / Network    │
+                         │ HTTP / SOCKS4 / SOCKS5│
+                         └───────────┬───────────┘
+                                     │
+                                     ▼
+                         ┌───────────────────────┐
+                         │    Authorized Target  │
+                         └───────────────────────┘
+```
+
+### Execution Model
+
+```text
+Configuration
+     │
+     ▼
+Method Selection
+     │
+     ▼
+Worker Initialization
+     │
+     ├── Goroutine 01
+     ├── Goroutine 02
+     ├── Goroutine 03
+     ├── Goroutine ...
+     └── Goroutine N
+             │
+             ▼
+       Request / Packet
+             │
+             ▼
+        Test Endpoint
+             │
+             ▼
+      Runtime Statistics
+```
+
+The workload is controlled through the CLI, allowing concurrency and duration to be adjusted according to the capacity of the test environment.
+
+---
+
+## Installation
+
+### Requirements
+
+| Component | Requirement     |
+| --------- | --------------- |
+| Go        | `1.21+`         |
+| Linux     | Supported       |
+| macOS     | Supported       |
+| Windows   | WSL recommended |
+
+### Clone
 
 ```bash
-# Clone the repository
-git clone [https://github.com/yinlewoaisuru/Slayer-L7.git](https://github.com/yinlewoaisuru/Slayer-L7.git)
+git clone https://github.com/nguyenphanno/Slayer-L7.git
 cd Slayer-L7
-
-# Initialize & fetch dependencies
-go mod init slayer
-go mod tidy
-
-# Build native binary with optimizations
-go build -ldflags="-s -w" -o slayer main.go
-
-# Grant execution rights (Linux / macOS)
-chmod +x slayer
-
 ```
 
----
-
-## ⚙️ CLI Flags & Configuration
+### Dependencies
 
 ```bash
-./slayer -t <TARGET_URL> -m <METHOD> -w <WORKERS> -d <DURATION> [-p <PROXY_FILE>]
-
+go mod tidy
 ```
 
-| Flag | Type | Description | Required | Default |
-| --- | --- | --- | --- | --- |
-| `-t` | `string` | Target URL/Endpoint (e.g., `https://example.com` or `http://mc.net:25565`) | ✅ | — |
-| `-m` | `string` | Attack method / test vector | ❌ | `httpget` |
-| `-w` | `int` | Concurrent worker threads (Goroutines) | ❌ | `2048` |
-| `-d` | `int` | Execution duration in seconds | ❌ | `30` |
-| `-p` | `string` | Path to proxy list file | ❌ | — |
-| `-r` | `int` | Per-worker request delay in milliseconds | ❌ | `0` |
-| `-v` | `bool` | Verbose error logging | ❌ | `false` |
+### Build
+
+```bash
+go build -ldflags="-s -w" -o slayer main.go
+```
+
+Linux / macOS:
+
+```bash
+chmod +x slayer
+```
+
+### Verify
+
+```bash
+./slayer --help
+```
 
 ---
 
-## 🛡️ Attack Vectors & Methods
+## Usage
 
-Slayer L7 includes over **75+ built-in test vectors** categorized across specific network layers and application behaviors:
+### Command Syntax
 
-| Vector | Target Mechanism | Primary Objective |
-| --- | --- | --- |
-| `httpget` | Cache-busted HTTP GET requests | Stress static application pages |
-| `httppost` | High-density JSON/Base64 payload POST | Exhaust backend application parsers |
-| `apiflood` | Deeply nested JSON tree queries | Strain REST API microservices |
-| `httpoptions` | CORS Preflight OPTIONS queries | Bypass serverless caching layers |
-| `httpdelete` | Resource deletion requests | Force intensive database authorization lookups |
-| `httpput` | Multipart data upload stream | Stress storage write queues |
-| `httphead` | Cache-bypass HEAD requests | Exhaust web server socket handlers |
-| `http_json` | High-depth structured JSON parsing | Exhaust Node.js / Python server loops |
-| `http_multipart` | Form-data file upload emulation | Fill temporary disk storage buffers |
-| `http_form_bomb` | Massive key-value pair injection | Saturate HTTP request parameter parsers |
-| `http_payload` | Raw random byte payload delivery | Test web server buffer bounds |
+```text
+./slayer -t <TARGET> -m <METHOD> -w <WORKERS> -d <DURATION> [OPTIONS]
+```
 
-| Vector | Target Mechanism | Primary Objective |
-| --- | --- | --- |
-| `rudy` | Slow POST body transmission (1 byte/sec) | Exhaust Apache/IIS thread pools |
-| `slowloris` | Partial HTTP header transmission | Occupy connection slots indefinitely |
-| `chunkpost` | Drip-fed chunked transfer encoding | Bypass proxy timeout controls |
-| `http_slow_read` | Micro-window TCP response consumption | Starve worker threads on web servers |
-| `http_dead_conn` | Long-lived idle TCP socket holding | Fill active socket descriptor tables |
-| `http_bad_start` | Incomplete HTTP header initializers | Stall connection state machines |
+### CLI Configuration
 
-| Vector | Target Mechanism | Primary Objective |
-| --- | --- | --- |
-| `rapidreset` | HTTP/2 Rapid Reset (CVE-2023-44487) | Overwhelm HTTP/2 framing layer |
-| `h2continuation` | HTTP/2 Continuation Flood (CVE-2024-2730) | Force OOM condition on load balancers |
-| `http_h2_flood` | Concurrent HTTP/2 stream generation | Exhaust HTTP/2 multiplexing limits |
-| `smuggle_clte` | CL.TE HTTP Request Smuggling | Test frontend/backend proxy alignment |
-| `smuggle_tete` | TE.TE HTTP Request Smuggling | Bypass WAF request inspection |
-| `http_conn_smuggle` | Keep-Alive connection smuggling | Test rate-limiting proxy enforcement |
+| Flag | Type     |   Default | Description                      |
+| ---- | -------- | --------: | -------------------------------- |
+| `-t` | `string` |         — | Target URL or endpoint           |
+| `-m` | `string` | `httpget` | Test method                      |
+| `-w` | `int`    |    `2048` | Concurrent workers               |
+| `-d` | `int`    |      `30` | Test duration in seconds         |
+| `-p` | `string` |         — | Proxy list path                  |
+| `-r` | `int`    |       `0` | Delay per worker in milliseconds |
+| `-v` | `bool`   |   `false` | Enable verbose logging           |
 
-| Vector | Target Mechanism | Primary Objective |
-| --- | --- | --- |
-| `mixpost` | Dynamic Content-Type polymorphism | Evade static signature-based WAFs |
-| `cfbypass` | Browser-accurate TLS fingerprinting | Evaluate CDN threat scoring |
-| `cache_poison` | Unkeyed header query injection | Test reverse proxy cache pollution |
-| `wsflood` | Persistent WebSocket connection holding | Exhaust full-duplex socket resources |
-| `headerflood` | Oversized HTTP headers (>100KB) | Trigger request header buffer overflows |
-| `cookiebomb` | Massive cookie string injection | Saturate session memory limits |
-| `range` | Overlapping Byte-Range request headers | Exhaust CPU during content reassembly |
-| `malformed` | Extremely long URI strings (>8KB) | Force crash in logging parsers |
+### Example
 
-| Vector | Target Mechanism | Primary Objective |
-| --- | --- | --- |
-| `xss_probe` | XSS vector query injection | Overwhelm security event logs |
-| `sqli_probe` | SQL syntax query injection | Stress WAF regex inspection engines |
-| `path_traversal` | Directory traversal string testing | Test path normalization rules |
-| `redos` | ReDoS triggers via complex strings | Cause high CPU utilization in regex evaluation |
-| `graphql_batch` | Multi-nested GraphQL queries | Force query engine execution loops |
-| `zstd_bomb` | High-compression ratio payloads | Cause memory spikes during body decompression |
-| `pingback` | XML-RPC Pingback reflection requests | Test legacy CMS endpoint vulnerabilities |
+```bash
+./slayer \
+  -t https://your-staging-environment.example \
+  -m httpget \
+  -w 100 \
+  -d 30
+```
 
-| Vector | Target Mechanism | Primary Objective |
-| --- | --- | --- |
-| `mc_ping` | Server List Ping spam | Evaluate Netty thread pool performance |
-| `mc_bot` | Simulated player login sequences | Stress authentication & proxy pipeline |
-| `mc_bigpacket` | Malformed VarInt frame sizing | Test protocol decoder stability |
-| `mc_legacy` | Legacy SLP handshake packets | Stress backward compatibility handlers |
-| `mc_hold` | Connection holding after ping | Occupy player slot limits |
-| `mc_bungee` | BungeeCord forwarding spoofing | Validate proxy IP forwarding rules |
-
-| Vector | Target Mechanism | Primary Objective |
-| --- | --- | --- |
-| `tcp_connect` | Full TCP connection handshake holding | Exhaust system connection limits |
-| `tcp_slow` | Drip-fed TCP data transmission | Bypass stateless SYN flood protections |
-| `udp_flood` | High-volume UDP datagram delivery | Test network interface card throughput |
-| `dns_query` | High-frequency DNS query requests | Stress recursive DNS resolver infrastructure |
-| `syn_flood` | Raw TCP SYN packet generation | Evaluate firewall conntrack table capacity |
-| `ack_flood` | High-rate TCP ACK packet stream | Overwhelm stateful firewall tracking |
+Start with a low concurrency level and gradually increase it while observing the target environment.
 
 ---
 
-## 🔧 Troubleshooting
+## Test Methods
 
-| Error / Symptom | Root Cause | Solution |
-| --- | --- | --- |
-| `Err: 377920` | Dead or unresponsive proxies | Update `proxy.txt` or remove `-p` to run in direct mode. |
-| `RPS: 1` | Local socket exhaustion (`TIME_WAIT`) | Lower worker count `-w` to `500-1000` or adjust OS socket reuse flags. |
-| Target blocks after ~100 req | Rate-limiting / IP firewall active | Utilize residential SOCKS5 proxies (`-p proxy.txt`). |
-| Visual artifacts in console | Terminal lacks ANSI color code support | Use Windows Terminal, Alacritty, or standard Linux/macOS bash terminals. |
+Slayer L7 contains a collection of protocol and application-level test scenarios.
+
+### HTTP Methods
+
+| Method           | Description                  |
+| ---------------- | ---------------------------- |
+| `httpget`        | HTTP GET request workload    |
+| `httppost`       | HTTP POST request workload   |
+| `httpoptions`    | OPTIONS / CORS handling      |
+| `httpdelete`     | DELETE request handling      |
+| `httpput`        | PUT request handling         |
+| `httphead`       | HEAD request handling        |
+| `http_json`      | JSON parser workload         |
+| `http_multipart` | Multipart form handling      |
+| `http_form_bomb` | Large parameter-set handling |
+| `http_payload`   | Request-body handling        |
+
+### Slow / Connection Tests
+
+| Method           | Description                  |
+| ---------------- | ---------------------------- |
+| `rudy`           | Slow request-body behavior   |
+| `slowloris`      | Partial HTTP header handling |
+| `chunkpost`      | Chunked transfer behavior    |
+| `http_slow_read` | Slow response consumption    |
+| `http_dead_conn` | Idle connection handling     |
+| `http_bad_start` | Incomplete request handling  |
+
+### HTTP/2 & Proxy Tests
+
+| Method              | Description                        |
+| ------------------- | ---------------------------------- |
+| `rapidreset`        | HTTP/2 reset behavior              |
+| `h2continuation`    | HTTP/2 continuation-frame handling |
+| `http_h2_flood`     | HTTP/2 stream-capacity testing     |
+| `smuggle_clte`      | CL/TE parser-alignment testing     |
+| `smuggle_tete`      | TE parser-alignment testing        |
+| `http_conn_smuggle` | Persistent connection validation   |
+
+### Web Application Tests
+
+| Method         | Description                  |
+| -------------- | ---------------------------- |
+| `mixpost`      | Content-Type handling        |
+| `cfbypass`     | CDN / WAF behavior research  |
+| `cache_poison` | Cache-key validation         |
+| `wsflood`      | WebSocket connection testing |
+| `headerflood`  | Large HTTP header testing    |
+| `cookiebomb`   | Cookie-size handling         |
+| `range`        | Range-request processing     |
+| `malformed`    | URI parser robustness        |
+
+### Input Validation
+
+| Method           | Description                        |
+| ---------------- | ---------------------------------- |
+| `xss_probe`      | XSS input validation               |
+| `sqli_probe`     | SQL injection detection validation |
+| `path_traversal` | Path normalization testing         |
+| `redos`          | Regex processing resilience        |
+| `graphql_batch`  | GraphQL workload testing           |
+| `zstd_bomb`      | Decompression-limit testing        |
+| `pingback`       | XML-RPC endpoint testing           |
+
+### Minecraft / Netty
+
+| Method         | Description                 |
+| -------------- | --------------------------- |
+| `mc_ping`      | Server-list ping testing    |
+| `mc_bot`       | Authentication-flow testing |
+| `mc_bigpacket` | Frame-decoder robustness    |
+| `mc_legacy`    | Legacy protocol handling    |
+| `mc_hold`      | Connection-limit testing    |
+| `mc_bungee`    | Proxy-forwarding validation |
+
+### Network
+
+| Method        | Description                     |
+| ------------- | ------------------------------- |
+| `tcp_connect` | TCP connection-capacity testing |
+| `tcp_slow`    | Slow TCP transfer testing       |
+| `udp_flood`   | UDP throughput testing          |
+| `dns_query`   | DNS resolver workload testing   |
+| `syn_flood`   | SYN handling validation         |
+| `ack_flood`   | Stateful firewall validation    |
 
 ---
 
-## ⚠️ Security & Legal Disclaimer
+## Proxy Support
 
-> [!CAUTION]
-> This tool is strictly intended for **authorized system administration, infrastructure stress testing, and academic research**. Executing uncoordinated stress tests against third-party systems without prior written consent is illegal and violates international cybercrime laws. The developers assume no responsibility for any misuse or damage caused by this software.
+Slayer L7 supports proxy-based testing using controlled proxy infrastructure.
+
+Supported proxy formats include:
+
+```text
+host:port
+```
+
+and, where supported by the implementation:
+
+```text
+username:password@host:port
+```
+
+Repository datasets:
+
+```text
+proxy.txt
+socks5.txt
+```
+
+User-Agent data:
+
+```text
+useragent.txt
+```
+
+### Recommended Practice
+
+Use proxies only when:
+
+* You own the proxy infrastructure;
+* You have permission to use it;
+* The traffic source is part of the authorized test scope.
 
 ---
 
-Developed for System Administrators & Security Researchers.
+## Project Structure
+
+The repository intentionally uses a compact structure rather than splitting the implementation into multiple internal packages.
+
+```text
+Slayer-L7/
+├── README.md
+├── LICENSE
+├── go.mod
+├── go.sum
+├── main.go
+├── proxy.txt
+├── socks5.txt
+└── useragent.txt
+```
+
+### File Reference
+
+| File            | Purpose                          |
+| --------------- | -------------------------------- |
+| `main.go`       | Main application and test engine |
+| `go.mod`        | Go module definition             |
+| `go.sum`        | Dependency checksums             |
+| `proxy.txt`     | Proxy dataset                    |
+| `socks5.txt`    | SOCKS5 proxy dataset             |
+| `useragent.txt` | User-Agent dataset               |
+| `README.md`     | Project documentation            |
+| `LICENSE`       | License information              |
+
+---
+
+## Testing Workflow
+
+A controlled resilience assessment should follow a gradual progression.
+
+```text
+┌─────────────────────┐
+│ 1. Define Scope     │
+│ Target + Test Window│
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ 2. Establish        │
+│ Baseline Metrics    │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ 3. Start Low Load   │
+│ Conservative Workers│
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ 4. Gradually Ramp   │
+│ Concurrency / Rate  │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ 5. Monitor System   │
+│ CPU / RAM / Network │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ 6. Analyze Results  │
+│ Bottlenecks / Errors│
+└─────────────────────┘
+```
+
+### Metrics Worth Monitoring
+
+* CPU utilization
+* Memory utilization
+* Network bandwidth
+* Active connections
+* Request latency
+* HTTP status codes
+* Application error rate
+* Database utilization
+* Reverse-proxy metrics
+* WAF events
+* System file descriptors
+
+---
+
+## Performance
+
+Slayer L7 is built around Go's lightweight concurrency model.
+
+### Goroutine-Based Execution
+
+```text
+                    Test Controller
+                           │
+                    ┌──────┴──────┐
+                    │ Worker Pool │
+                    └──────┬──────┘
+                           │
+             ┌─────────────┼─────────────┐
+             ▼             ▼             ▼
+         Worker 1      Worker 2      Worker N
+             │             │             │
+             └─────────────┼─────────────┘
+                           ▼
+                    Network Layer
+                           │
+                           ▼
+                     Test Target
+```
+
+Actual throughput depends on both the testing machine and target environment.
+
+Important limiting factors include:
+
+* CPU
+* RAM
+* File descriptors
+* Ephemeral ports
+* Network bandwidth
+* Kernel socket limits
+* Proxy capacity
+* Target-side rate limits
+* Application architecture
+
+> Higher worker counts do not necessarily produce better test results. Controlled load progression generally produces more useful capacity measurements.
+
+---
+
+## Troubleshooting
+
+| Symptom                      | Likely Cause                | Action                                      |
+| ---------------------------- | --------------------------- | ------------------------------------------- |
+| `Err: 377920`                | Invalid / unavailable proxy | Validate the proxy list                     |
+| Very low RPS                 | Local resource exhaustion   | Reduce `-w` and inspect system limits       |
+| Connections stop increasing  | Rate limiting               | Inspect WAF / reverse-proxy logs            |
+| Increasing latency           | Application saturation      | Inspect CPU, database and upstream services |
+| Console artifacts            | ANSI compatibility          | Use a modern terminal                       |
+| Frequent connection failures | Socket exhaustion           | Reduce concurrency and inspect OS limits    |
+
+### Verbose Diagnostics
+
+```bash
+./slayer \
+  -t https://your-staging-environment.example \
+  -m httpget \
+  -w 100 \
+  -d 30 \
+  -v
+```
+
+---
+
+## Roadmap
+
+* [ ] Structured JSON output
+* [ ] Config-file support
+* [ ] Improved latency statistics
+* [ ] Scenario presets
+* [ ] Result export
+* [ ] Prometheus metrics
+* [ ] Interactive terminal dashboard
+* [ ] Better proxy health monitoring
+* [ ] Improved HTTP/2 diagnostics
+* [ ] Test-session reporting
+* [ ] Controlled distributed testing
+
+---
+
+## Security & Legal
+
+> [!WARNING]
+> **Authorized use only.**
+>
+> Slayer L7 is designed for system administrators, infrastructure engineers and security researchers performing controlled testing on systems they own or have explicit authorization to assess.
+>
+> High-volume traffic and resource-exhaustion scenarios can affect service availability. Define the target scope, obtain authorization and establish a controlled testing window before execution.
+>
+> The project authors are not responsible for damage, disruption or misuse resulting from unauthorized deployment.
+
+---
+
+## Contributing
+
+Contributions that improve the project's reliability, documentation, observability and authorized testing capabilities are welcome.
+
+Before submitting a pull request:
+
+1. Keep changes focused.
+2. Document new configuration options.
+3. Test changes in an isolated environment.
+4. Update the README when behavior changes.
+5. Avoid committing credentials, private proxy lists or other sensitive data.
+
+---
+
+## License
+
+Distributed under the **MIT License**.
+
+See [`LICENSE`](LICENSE) for details.
+
+---
+
+<div align="center">
+
+## SLAYER L7
+
+**Measure · Analyze · Harden**
+
+Multi-protocol resilience testing for authorized environments.
+
+</div>
