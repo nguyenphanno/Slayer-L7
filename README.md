@@ -8,7 +8,7 @@
   <a href="https://go.dev/">
     <img src="https://img.shields.io/badge/Go-1.21%2B-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go 1.21+">
   </a>
-  <img src="https://img.shields.io/badge/Methods-75%2B-6E56CF?style=for-the-badge" alt="75+ Methods">
+  <img src="https://img.shields.io/badge/Methods-85%2B-6E56CF?style=for-the-badge" alt="85+ Methods">
   <img src="https://img.shields.io/badge/Architecture-Goroutines-2EA44F?style=for-the-badge&logo=go&logoColor=white" alt="Goroutines">
   <img src="https://img.shields.io/badge/Proxy-SOCKS4%20%7C%20SOCKS5%20%7C%20HTTP-24292F?style=for-the-badge" alt="Proxy">
   <img src="https://img.shields.io/badge/License-MIT-0969DA?style=for-the-badge&logo=opensourceinitiative&logoColor=white" alt="MIT License">
@@ -73,6 +73,8 @@ The project provides a single lightweight executable capable of generating contr
 * Cache behavior testing
 * WebSocket testing
 * GraphQL workloads
+* **XML/SOAP Entity Expansion**
+* **Chunked Transfer Slowloris**
 
 </td>
 <td width="50%" valign="top">
@@ -88,6 +90,9 @@ The project provides a single lightweight executable capable of generating contr
 * BungeeCord-compatible flows
 * Persistent connections
 * Proxy-based testing
+* **HTTP/2 Window Exhaustion**
+* **HTTP/2 Continuation Bomb**
+* **HTTP/2 Rapid Reset (Adv)**
 
 </td>
 </tr>
@@ -104,6 +109,8 @@ The project provides a single lightweight executable capable of generating contr
 * User-Agent rotation
 * Low-overhead execution
 * Long-running test sessions
+* **Optimized Core (math/rand/v2)**
+* **Dynamic Buffer Sizing**
 
 </td>
 <td valign="top">
@@ -118,6 +125,8 @@ The project provides a single lightweight executable capable of generating contr
 * HTTP/2 behavior analysis
 * Input validation testing
 * Infrastructure resilience testing
+* **Deep Recursion DoS**
+* **ReDoS Multi-format**
 
 </td>
 </tr>
@@ -292,6 +301,16 @@ Slayer L7 contains a collection of protocol and application-level test scenarios
 | `http_form_bomb` | Large parameter-set handling |
 | `http_payload`   | Request-body handling        |
 
+### Advanced L7 Payloads (New)
+
+| Method        | Description                                            |
+| ------------- | ------------------------------------------------------ |
+| `mixpost`     | Multi-format Content-Type handling                     |
+| `mixheavy`    | Deep XML/SOAP entity expansion and parser exhaustion   |
+| `mixbunchof`  | Multipart boundary hell (200+ mixed parts)             |
+| `mixregex`    | Multi-format ReDoS (Regular Expression DoS) injection  |
+| `mixchunked`  | Slow chunked transfer encoding across multiple formats |
+
 ### Slow / Connection Tests
 
 | Method           | Description                  |
@@ -305,39 +324,41 @@ Slayer L7 contains a collection of protocol and application-level test scenarios
 
 ### HTTP/2 & Proxy Tests
 
-| Method              | Description                        |
-| ------------------- | ---------------------------------- |
-| `rapidreset`        | HTTP/2 reset behavior              |
-| `h2continuation`    | HTTP/2 continuation-frame handling |
-| `http_h2_flood`     | HTTP/2 stream-capacity testing     |
-| `smuggle_clte`      | CL/TE parser-alignment testing     |
-| `smuggle_tete`      | TE parser-alignment testing        |
-| `http_conn_smuggle` | Persistent connection validation   |
+| Method              | Description                            |
+| ------------------- | -------------------------------------- |
+| `rapidreset`        | HTTP/2 reset behavior                  |
+| `h2continuation`    | HTTP/2 continuation-frame handling     |
+| `http_h2_flood`     | HTTP/2 stream-capacity testing         |
+| `h2_window`         | HTTP/2 Window Exhaustion (Stream Hold) |
+| `h2_cont_bomb`      | HTTP/2 CONTINUATION Bomb Amplification |
+| `smuggle_clte`      | CL/TE parser-alignment testing         |
+| `smuggle_tete`      | TE parser-alignment testing            |
+| `http_conn_smuggle` | Persistent connection validation       |
 
 ### Web Application Tests
 
-| Method         | Description                  |
-| -------------- | ---------------------------- |
-| `mixpost`      | Content-Type handling        |
-| `cfbypass`     | CDN / WAF behavior research  |
-| `cache_poison` | Cache-key validation         |
-| `wsflood`      | WebSocket connection testing |
-| `headerflood`  | Large HTTP header testing    |
-| `cookiebomb`   | Cookie-size handling         |
-| `range`        | Range-request processing     |
-| `malformed`    | URI parser robustness        |
+| Method         | Description                   |
+| -------------- | ----------------------------- |
+| `cfbypass`     | CDN / WAF behavior research   |
+| `cache_poison` | Cache-key validation          |
+| `wsflood`      | WebSocket connection testing  |
+| `headerflood`  | Large HTTP header testing     |
+| `cookiebomb`   | Cookie-size handling          |
+| `range`        | Range-request processing      |
+| `malformed`    | URI parser robustness         |
 
-### Input Validation
+### Input Validation & Exhaustion
 
-| Method           | Description                        |
-| ---------------- | ---------------------------------- |
-| `xss_probe`      | XSS input validation               |
-| `sqli_probe`     | SQL injection detection validation |
-| `path_traversal` | Path normalization testing         |
-| `redos`          | Regex processing resilience        |
-| `graphql_batch`  | GraphQL workload testing           |
-| `zstd_bomb`      | Decompression-limit testing        |
-| `pingback`       | XML-RPC endpoint testing           |
+| Method               | Description                        |
+| -------------------- | ---------------------------------- |
+| `xss_probe`          | XSS input validation               |
+| `sqli_probe`         | SQL injection detection validation |
+| `path_traversal`     | Path normalization testing         |
+| `redos`              | Regex processing resilience        |
+| `graphql_batch`      | GraphQL workload testing           |
+| `graphql_recursion`  | Deep recursion parser exhaustion   |
+| `zstd_bomb`          | Decompression-limit testing        |
+| `pingback`           | XML-RPC endpoint testing           |
 
 ### Minecraft / Netty
 
